@@ -4,6 +4,11 @@ const linux = std.os.linux;
 const assert = std.debug.assert;
 const panic = std.debug.panic;
 
+/// Used for documentation but can be used in testing to test both branches.
+pub fn maybe(ok: bool) void {
+    assert(ok or !ok);
+}
+
 pub fn clock_gettime(clock_type: linux.clockid_t) !linux.timespec {
     var timespec: linux.timespec = .{ .sec = 0, .nsec = 0 };
     const result: linux.E = linux.errno(linux.clock_gettime(clock_type, &timespec));
@@ -26,7 +31,7 @@ pub fn total_buffers_count(
     assert(max_clients_count > 0);
     assert(max_udp_destinations > 0);
     var total: usize = 0;
-    total += 1; // client tcp connection to the proxy.
+    total += 1; // client tcp connection to the proxy. (this doesn't need its own 64kb, but whatever, it's no big deal. ram is cheap h a h...)
     total += 1; // client udp connection to the proxy.
     total += max_udp_destinations; // proxy udp connections to destinations.
     total *= max_clients_count;

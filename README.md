@@ -14,3 +14,10 @@ Designed with these ideas in mind:
 
 * **OS:** Linux kernel 7.1+.
 * **Compiler:** Zig 0.16.0 compiler.
+
+## Roadmap
+- [x] SOCKS5 handshake.
+- [x] `NO AUTH` method support.
+- [x] `CONNECT` command support.
+- [ ] credentials (pwd) method authentication.
+- [ ] `UDP ASSOCIATE` command support.

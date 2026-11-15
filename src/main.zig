@@ -18,12 +18,17 @@ const OsError = utils.OsError;
 const IO_Uring = linux.IoUring;
 const IP_Address = IO.net.IpAddress;
 const PosixAddress = IO.Threaded.PosixAddress;
+const Allocator = std.mem.Allocator;
 
 const panic = std.debug.panic;
 const assert = std.debug.assert;
+const maybe = utils.maybe;
 const errno_as_error = utils.errno_as_error;
 const address_to_posix = IO.Threaded.addressToPosix;
 
+const is_debug_mode = builtin.mode == .Debug or builtin.mode == .ReleaseSafe;
+
+// NOTE: Only the `none` and `credentials` will be supported.
 const AuthMethod = enum(u8) {
     none = 0,
 
@@ -37,6 +42,8 @@ const AuthMethod = enum(u8) {
 
     challenge_response_authentication_method = 5,
 
+    // There's little use case for this. If TLS is important to a proxy operator
+    // they must wrap the entire connection in it rather than negotiate it.
     tls = 6,
 
     novell_directory_services_authentication = 7,
@@ -106,6 +113,17 @@ const CommandRequest = struct {
         },
     },
 
+    fn address_type(command_request: *const CommandRequest) enum { ipv4, ipv6, domain_name } {
+        return switch (command_request.destination_address) {
+            .posix_address => |*posix_address| switch (posix_address.any.family) {
+                linux.AF.INET => .ipv4,
+                linux.AF.INET6 => .ipv6,
+                else => unreachable,
+            },
+            .domain_name => .domain_name,
+        };
+    }
+
     /// Requires that name resolution be performed before calling this function.
     pub fn address_family(command_request: *const CommandRequest) u32 {
         return switch (command_request.ip_address_type()) {
@@ -131,11 +149,7 @@ const CommandRequest = struct {
     pub fn destination_ip_address(command_request: *const CommandRequest) u128 {
         switch (command_request.destination_address) {
             .posix_address => |*posix_address| {
-                return switch (posix_address.any.family) {
-                    linux.AF.INET => @as(u128, posix_address.in.addr),
-                    linux.AF.INET6 => std.mem.readInt(u128, &posix_address.in6.addr, .big), // TODO: test the endianess.
-                    else => unreachable,
-                };
+                return net.ip_address_from_posix_address(posix_address);
             },
             .domain_name => unreachable,
         }
@@ -143,12 +157,12 @@ const CommandRequest = struct {
 
     pub fn destination_port(command_request: *const CommandRequest) u16 {
         return switch (command_request.destination_address) {
-            .posix_address => |posix_address| switch (posix_address.any.family) {
+            .posix_address => |*posix_address| switch (posix_address.any.family) {
                 linux.AF.INET => posix_address.in.port,
                 linux.AF.INET6 => posix_address.in6.port,
                 else => unreachable,
             },
-            .domain_name => |domain_info| domain_info.port,
+            .domain_name => |*domain_info| domain_info.port,
         };
     }
 };
@@ -291,9 +305,11 @@ const command_negotiation_success_ipv4_reply_message_size = 1 + 1 + 1 + 1 + 4 + 
 /// VER(1) + REP(1) + RSV(1) + ATYP(1) + BND.ADDR(16) + BND.PORT(2).
 const command_negotiation_success_ipv6_reply_message_size = 1 + 1 + 1 + 1 + 16 + 2;
 
-/// Same as the command_negotiation_request in size.
-/// VER(1) + REP(1) + RSV(1) + ATYP(1) + BND.ADDR(1+255) + BND.PORT(2).
-const command_negotiation_success_reply_message_max_size = 1 + 1 + 1 + 1 + (1 + 255) + 2;
+/// This is an invalid reply. The address cannot be a domain name.
+const _command_negotiation_success_reply_message_max_size = 1 + 1 + 1 + 1 + (1 + 255) + 2;
+
+/// The command reply on success when dealing with a CONNECT session.
+const command_negotiation_success_reply_for_connect = build_command_success_reply(Address{ .ipv4 = 0 }, 0);
 
 /// TODO: Reject any length (ULEN/PLEN) equal to zero..
 /// VER(1) + ULEN(1) + UNAME(1) + PLEN(1) + PASSWD(1)
@@ -375,6 +391,8 @@ fn parse_and_validate_credentials_sub_negotiation_request(buffer: []const u8) Cr
 
 const available_auth_methods = [_]AuthMethod{.none};
 
+const available_commands = [_]Command{.connect};
+
 const Command = enum(u8) {
     none = 0,
     connect = 1,
@@ -431,6 +449,9 @@ pub fn build_commmand_failure_reply(comptime reply: Reply) [command_negotiation_
     return [_]u8{ constants.socks_version, rep, rsv, atyp } ++ bnd_addr ++ bnd_port;
 }
 
+// Only useful to call for a UDP Associate session which has a dynamic port aspect to it which the client needs to be informed of.
+// For CONNECT sessions we can send the address and port as zeroes.
+// Due to the dynamic nature of the address's value, this must be stored within `buffer_ptr` before being sent out.
 pub fn build_command_success_reply(
     comptime addr: Address,
     port: u16,
@@ -439,13 +460,15 @@ pub fn build_command_success_reply(
     .ipv6 => [command_negotiation_success_ipv6_reply_message_size]u8,
     else => unreachable,
 } {
-    assert(port > 0);
+    if (!@inComptime()) {
+        assert(port > 0);
+    }
     const rsv: u8 = 0;
     const rep: u8 = @intFromEnum(Reply.success);
     const atyp: u8 = @intFromEnum(@as(AddressType, addr));
     return switch (addr) {
-        .ipv4 => [_]u8{ constants.socks_version, rep, rsv, atyp } ++ std.mem.toBytes(addr.ipv4) + std.mem.toBytes(port),
-        .ipv6 => [_]u8{ constants.socks_version, rep, rsv, atyp } ++ std.mem.toBytes(addr.ipv6) + std.mem.toBytes(port),
+        .ipv4 => [_]u8{ constants.socks_version, rep, rsv, atyp } ++ std.mem.toBytes(addr.ipv4) ++ std.mem.toBytes(port),
+        .ipv6 => [_]u8{ constants.socks_version, rep, rsv, atyp } ++ std.mem.toBytes(addr.ipv6) ++ std.mem.toBytes(port),
         else => unreachable,
     };
 }
@@ -468,6 +491,8 @@ comptime {
     if (builtin.mode != .Debug) // Useful when experimenting locally.
         assert(std.mem.findScalar(AuthMethod, &available_auth_methods, .none) == null);
 
+    assert(std.mem.findScalar(AuthMethod, &available_auth_methods, .tls) == null);
+
     // It makes no sense for the `.unacceptable` method to be in the available_auth_methods.
     assert(std.mem.findScalar(AuthMethod, &available_auth_methods, .gssapi) == null);
     assert(std.mem.findScalar(AuthMethod, &available_auth_methods, .unacceptable) == null);
@@ -475,8 +500,10 @@ comptime {
     assert(std.mem.findScalar(AuthMethod, &available_auth_methods, .challenge_response_authentication_method) == null);
     assert(std.mem.findScalar(AuthMethod, &available_auth_methods, .challenge_handshake_authentication_protocol) == null);
 
-    // assert(std.mem.findScalar(AuthMethod, &available_auth_methods, .tls) != null);
     // assert(std.mem.findScalar(AuthMethod, &available_auth_methods, .credentials) != null);
+
+    assert(std.mem.findScalar(Command, &available_commands, .none) == null);
+    assert(std.mem.findScalar(Command, &available_commands, .bind) == null); // Won't support the BIND command.
 }
 
 const ConnectionPhase = enum {
@@ -530,28 +557,22 @@ const Operation = union(enum) {
     connect: struct {
         socket: linux.fd_t,
         address: PosixAddress,
-        address_size: linux.socklen_t,
-
         // NOTE: Timeout is non negotiable.
         timeout: struct {
             ts: linux.kernel_timespec,
             flags: u32,
         },
     },
-    close: struct {
+    close: struct { // Only used for sockets.
         fd: linux.fd_t,
     },
-    // shutdown_write_side: struct {
-    //     socket: linux.fd_t,
-    // },
-    // shutdown_socket: struct { // for shutting down the socket on both ends.
-    //     socket: linux.fd_t,
-    // },
     shutdown: struct {
         socket: linux.fd_t,
-        how: u32,
     },
     cancel_all_requests: void,
+    /// Its sole purpose is to coordinate safe session teardown and requests cancelation during proxy shutdown.
+    /// TODO: change name to something more appropriate like final_op.
+    nop: void,
 };
 
 /// NOTE: The connection is responsible for setting its own state.
@@ -571,13 +592,14 @@ const ConnectionState = union(enum) {
     /// This is extremly unlikely to happen for a small amount of bytes, but you can never been too careful with this.
     auth_method_negotiation: u8,
 
-    /// For credentials or TLS negotiation.
-    ///
-    /// TLS Handshake can have a size of up to u24 bytes.
-    /// We won't tolerate that here, anything beyond 32kb will be dropped.
-    auth_sub_negotiation: u16,
+    /// For credentials negotiation.
+    auth_sub_negotiation: u10,
 
     /// Holds the amount of bytes in the command negotiation phase.
+    ///
+    /// It also has a dual use:
+    /// 1) When receiving the command request bytes
+    /// 2) When sending the command request bytes
     command_negotiation: u9,
 
     // /// The next state after `command_negotiation`. This will contain the same amount of bytes as `command_negotiation`.
@@ -596,6 +618,7 @@ const ConnectionState = union(enum) {
     /// Used when an error or disconnection occurs during the auth negotiation / command negotiation / transferring phase.
     terminating: ConnectionPhase,
 
+    /// Used for coordinating shutdown for Connection which exist in an established session.
     terminated,
 };
 
@@ -673,6 +696,16 @@ const Connection = struct {
 
 const SessionId = u128;
 
+const ClientUDPConnection = struct {
+    connection: Connection,
+    inflight_sends: std.ArrayListUnmanaged(Operation),
+
+    pub fn init(max_udp_destinations: u8, allocator: Allocator) Allocator.Error!ClientUDPConnection {
+        assert(max_udp_destinations > 0);
+        _ = &allocator;
+    }
+};
+
 const Session = union(enum(u1)) {
     connect: struct {
         client_tcp_data_plane: Connection,
@@ -683,6 +716,52 @@ const Session = union(enum(u1)) {
         client_tcp_control_plane: Connection,
         udp_destinations: std.ArrayListUnmanaged(Connection), // max_udp_destinations is known at runtime.
     },
+
+    pub fn id(self: *const Session) SessionId {
+        switch (self.*) {
+            .connect => |*connect_session| {
+                assert(connect_session.client_tcp_data_plane.session_id == connect_session.server_tcp_data_plane.session_id);
+                return connect_session.client_tcp_data_plane.session_id;
+            },
+            .udp_associate => |*udp_associate_session| {
+                assert(udp_associate_session.client_udp_data_plane.session_id == udp_associate_session.client_tcp_control_plane.session_id);
+                const session_id = udp_associate_session.client_udp_data_plane.session_id;
+                if (is_debug_mode) {
+                    for (udp_associate_session.udp_destinations.items) |*server_udp_data_plane|
+                        assert(server_udp_data_plane.session_id == session_id);
+                }
+                return session_id;
+            },
+        }
+    }
+
+    pub fn assert_invariants(session: *const Session) void {
+        switch (session.*) {
+            .connect => |*connect_session| {
+                const client_connection = &connect_session.client_tcp_data_plane;
+                const server_connection = &connect_session.server_tcp_data_plane;
+                assert(client_connection.socket != server_connection.socket);
+                assert(client_connection.session_id == server_connection.session_id);
+
+                assert(client_connection.kind == .client_tcp);
+                assert(server_connection.kind == .server_tcp);
+
+                assert(client_connection.negotiated_command != .none);
+                assert(server_connection.negotiated_command != .none);
+
+                assert(
+                    client_connection.state == .command_negotiation or
+                    client_connection.state == .transferring or
+                    client_connection.state == .terminated or
+                    (client_connection.state == .terminating and client_connection.state.terminating == .transferring));
+
+                assert(server_connection.state == .transferring or
+                    server_connection.state == .terminated or
+                    (server_connection.state == .terminating and server_connection.state.terminating == .transferring));
+            },
+            .udp_associate => unreachable, // TODO(UDP)
+        }
+    }
 };
 
 const ProxyStats = struct {
@@ -733,7 +812,7 @@ const ProxyConfig = struct {
     // NOTE: read the NOTES part of listen(2) before modifying this.
     listen_backlog: u32 = 64,
 
-    defer_accept_timeout_sec: ?c_int = 10,
+    defer_accept_timeout_sec: c_int = 10,
 
     // TODO: add support for multiple addresses and custom ports.
     ip_address: IP_Address,
@@ -743,6 +822,51 @@ const ProxyConfig = struct {
     forbidden_dst_ipv4_addresses: []u32,
     forbidden_dst_ipv6_addresses: []u128,
     forbidden_dst_domain_names: [][]const u8,
+
+    pub fn init(config: struct {
+        io_ring_size: ?u16,
+        max_clients_count: ?u16,
+        max_udp_destinations: ?u8,
+        listen_backlog: ?u32,
+        defer_accept_timeout_sec: ?c_int,
+
+        ip_address: IP_Address,
+        forbidden_dst_ports: []u16,
+        forbidden_dst_ipv4_addresses: []u32,
+        forbidden_dst_ipv6_addresses: []u128,
+        forbidden_dst_domain_names: [][]const u8,
+    }) !ProxyConfig {
+        var proxy_config: ProxyConfig = .{
+            .ip_address = config.ip_address,
+            .forbidden_dst_ports = config.forbidden_dst_ports,
+            .forbidden_dst_ipv4_addresses = config.forbidden_dst_ipv4_addresses,
+            .forbidden_dst_ipv6_addresses = config.forbidden_dst_ipv6_addresses,
+            .forbidden_dst_domain_names = config.forbidden_dst_domain_names,
+        };
+        if (config.io_ring_size) |value| {
+            if (value == 0) return error.ZeroRingSize;
+            if (value % 2 != 0) return error.OddRingSize;
+            proxy_config.io_ring_size = value;
+        }
+        if (config.max_clients_count) |value| {
+            if (value == 0) return error.ZeroMaxClientsCount;
+            proxy_config.max_clients_count = value;
+        }
+        if (config.max_udp_destinations) |value| {
+            if (value == 0) return error.ZeroMaxUdpDestinations;
+            proxy_config.max_udp_destinations = value;
+        }
+        if (config.listen_backlog) |value| {
+            // NOTE: 0 listen backlog is a valid value (read the code for: sk_acceptq_is_full(const struct sock *sk) in the kernel).
+            proxy_config.listen_backlog = value;
+        }
+        if (config.defer_accept_timeout_sec) |value| {
+            if (value == 0) return error.ZeroDeferAcceptTimeoutSeconds;
+            if (value < 0) return error.NegativeDeferAcceptTimeoutSeconds;
+            proxy_config.defer_accept_timeout_sec = value;
+        }
+        return proxy_config;
+    }
 };
 
 const Socks5Proxy = struct {
@@ -760,6 +884,8 @@ const Socks5Proxy = struct {
 
     read_signalfd_operation: Operation,
 
+    proxy_termination_operation: Operation,
+
     /// Used for linking the client and server(s) and helps with clean up.
     session_id: SessionId,
 
@@ -771,7 +897,7 @@ const Socks5Proxy = struct {
     /// Contains clients currently in negotiation phase, i.e those which have yet to chose the desired command.
     pending_clients: std.AutoHashMapUnmanaged(linux.fd_t, Connection),
 
-    pub fn init(proxy_config: ProxyConfig, allocator: std.mem.Allocator) !Socks5Proxy {
+    pub fn init(proxy_config: ProxyConfig, allocator: Allocator) !Socks5Proxy {
         const ring_flags: u32 =
             linux.IORING_SETUP_SUBMIT_ALL |
             linux.IORING_SETUP_COOP_TASKRUN |
@@ -829,6 +955,8 @@ const Socks5Proxy = struct {
                 .siginfo = std.mem.zeroInit(linux.signalfd_siginfo, .{}),
             },
         };
+
+        const proxy_termination_operation = Operation{ .nop = {} };
         const proxy = Socks5Proxy{
             .config = proxy_config,
 
@@ -846,6 +974,7 @@ const Socks5Proxy = struct {
 
             .accept_operation = undefined,
             .read_signalfd_operation = read_signalfd_operation,
+            .proxy_termination_operation = proxy_termination_operation,
         };
         return proxy;
     }
@@ -872,7 +1001,7 @@ const Socks5Proxy = struct {
                 _ = self.submit_all_no_wait() catch unreachable;
                 if (should_continue) continue;
             } else |err| {
-                std.log.err("handle_cqes encountered an error: {s}.", .{@errorName(err)});
+                std.log.err("encountered an error while handling cqes: {any}. exiting the proxy.", .{err});
             }
             // NOTE: A socks5 proxy has no insight into the bytes it transports (more or less).
             // Graceful termination is therefore impossible. Thus, we take the easy the path here,
@@ -906,27 +1035,343 @@ const Socks5Proxy = struct {
                         break; // We drop the next CQEs.
                     }
                 },
-                .cancel_all_requests => unreachable, // Should be used
+                .connect => self.handle_connect(completion),
+                .create_socket => self.handle_create_socket(completion),
+                .cancel_all_requests => unreachable,
                 else => unreachable,
             }
         }
         return should_continue;
     }
 
-    pub fn handle_shutdown(self: *Socks5Proxy, completion: *linux.io_uring_cqe) void {
+    pub fn handle_create_socket(self: *Socks5Proxy, completion: *const linux.io_uring_cqe) void {
+        const operation: *Operation = @ptrFromInt(completion.user_data);
+        assert(operation.* == .create_socket);
+
+        const connection: *Connection = @alignCast(@fieldParentPtr("inflight_operation", operation));
+        assert(connection.negotiated_command == .connect or
+            connection.negotiated_command == .udp_associate);
+
+        const result: OsError!linux.fd_t = if (completion.res < 0)
+            io_utils.io_uring_error(completion.res)
+        else
+            @intCast(completion.res);
+
+        // TODO: Add this XOR assertion everywhere that is appropriate.
+        const is_pending_client = self.pending_clients.contains(connection.socket);
+        const is_active_session = self.active_sessions.contains(connection.session_id);
+        assert(is_active_session != is_pending_client);
+
+        if (result) |socket| {
+            assert(socket > 2);
+            defer assert(connection.state.command_negotiation == 0);
+            switch (connection.negotiated_command) {
+                .connect => {
+                    // Unlike the UDP_Associate, the CONNECT method requires a single create_socket + connect.
+                    // And this may only happen before session establishement (client still in pending).
+                    assert(is_pending_client);
+                    assert(connection.kind == .client_tcp);
+                    assert(connection.state == .command_negotiation);
+                    assert(connection.state.command_negotiation > 0);
+
+                    // NOTE: DNS resolution should've been performed by now.
+                    const command_request =
+                        parse_command_negotiation_request(connection.buffer_ptr[0..connection.state.command_negotiation]) catch unreachable;
+
+                    const connect_deadline_ns: u64 = connection.established_at_ns + (constants.max_connect_deadline_sec * std.time.ns_per_s);
+                    self.enqueue_connect(
+                        &connection.inflight_operation,
+                        socket,
+                        command_request.destination_address.posix_address,
+                        .{
+                            .ts = .{
+                                .sec = @intCast(connect_deadline_ns / std.time.ns_per_s),
+                                .nsec = @intCast(connect_deadline_ns % std.time.ns_per_s),
+                            },
+                            .flags = linux.IORING_TIMEOUT_ABS | linux.IORING_TIMEOUT_BOOTTIME,
+                        },
+                    );
+                    connection.state = .{ .command_negotiation = 0 };
+                },
+                // TODO(UDP)
+                .udp_associate => {
+                    // NOTE: For udp_associate we may need to enqueue many create_socket over the lifetime of the session.
+                    connection.state = .{ .command_negotiation = 0 };
+                },
+                else => unreachable,
+            }
+        } else |err| {
+            switch (connection.negotiated_command) {
+                .none => unreachable,
+                .connect => {
+                    assert(is_pending_client);
+                    assert(connection.kind == .client_tcp);
+                    assert(connection.state == .command_negotiation);
+                    assert(connection.state.command_negotiation > 0);
+                    switch (err) {
+                        error.AFNOSUPPORT, error.PROTONOSUPPORT => unreachable,
+                        error.PROTOTYPE, error.ACCES, error.INVAL => unreachable,
+                        else => {
+                            std.log.debug("client(ip={d}, port={d}): failed creating the socket {any}.", .{
+                                connection.remote_ip_address(),
+                                connection.port(),
+                                err,
+                            });
+                            self.enqueue_connection_reply_for_termination(connection, .socks_server_failure);
+                        },
+                    }
+                },
+                .udp_associate => unreachable, // TODO(UDP)
+                else => unreachable,
+            }
+        }
+    }
+
+    pub fn handle_shutdown(self: *Socks5Proxy, completion: *const linux.io_uring_cqe) void {
         const operation: *Operation = @ptrFromInt(completion.user_data);
         assert(operation.* == .shutdown);
         assert(operation.shutdown.socket > 2);
-        assert(operation.shutdown.how == linux.SHUT.RDWR);
+        assert(completion.res <= 0);
 
-        // TODO: finish
-        _ = &self;
+        const connection: *Connection = @alignCast(@fieldParentPtr("inflight_operation", operation));
+        assert(!self.pending_clients.contains(connection.socket));
+
+        const result: ?OsError = if (completion.res == 0) null else io_utils.io_uring_error(completion.res);
+        if (result) |err| {
+            switch (err) {
+                error.NOBUFS => {
+                    // This is trouble if it ever occurs. Imagine running shutdown(2) on the connection's socket to
+                    // cancel a pending send that the peer is currently performing. If this ENOBUFS happens, then
+                    // the send may be blocked indefinitely and its CQE never posted. Calling close(2) on that socket
+                    // *will not* cancel the inflight send by the way, so don't even bother with that. Only reasonable solution
+                    // seems to be a retry. But won't the enqueue_shutdown below also fail when submitting SQES to the kernel
+                    // with a similar error?
+                    std.log.warn("connection(ip={d}, port={d}, state={any}): shutdown failed due to lack of system resources to perform syscall on socket {d}.", .{
+                        connection.remote_ip_address(),
+                        connection.port(),
+                        connection.state,
+
+                        operation.shutdown.socket,
+                    });
+                    // NOTE: We retry the operation until it works, otherwise we'll be leaking FDs and not making progress with session teardown.
+                    self.enqueue_shutdown(&connection.inflight_operation, operation.shutdown.socket);
+                    return;
+                },
+
+                error.CANCELED => unreachable,
+
+                error.BADF => unreachable,
+                error.INVAL => unreachable,
+                error.NOTSOCK => unreachable,
+                error.NOTCONN => unreachable,
+                else => panic("connection(ip={d}, port={d}, state={any}): socket {d} shutdown failed: {any}.", .{
+                    connection.remote_ip_address(),
+                    connection.port(),
+                    connection.state,
+
+                    operation.shutdown.socket,
+                    err,
+                }),
+            }
+            return;
+        }
+
+        const session: *Session = self.active_sessions.getPtr(connection.session_id).?;
+        session.assert_invariants();
+
+        switch (session.*) {
+            .connect => |*connect_session| {
+                const client_connection: *Connection = &connect_session.client_tcp_data_plane;
+                const server_connection: *Connection = &connect_session.server_tcp_data_plane;
+
+                const opposing_connection = if (connection == client_connection)
+                    server_connection
+                else if (connection == server_connection)
+                    client_connection
+                else
+                    unreachable;
+
+                assert((client_connection.state == .terminating and client_connection.state.terminating == .transferring) and
+                    (server_connection.state == .terminating and server_connection.state.terminating == .transferring));
+
+                const is_socket_owner = connection.socket == operation.shutdown.socket;
+                if (is_socket_owner) {
+                    assert(!self.pending_clients.contains(connection.socket));
+                    assert(!self.pending_clients.contains(opposing_connection.socket));
+                    self.enqueue_connection_close(connection);
+                } else {
+                    assert(opposing_connection.socket == operation.shutdown.socket);
+                    self.enqueue_shutdown(&connection.inflight_operation, connection.socket);
+                }
+            },
+
+            .udp_associate => |*udp_associate_session| _ = &udp_associate_session, // TODO: finish
+        }
     }
 
-    pub fn handle_close(self: *Socks5Proxy, completion: *linux.io_uring_cqe) void {
+    pub fn handle_connect(self: *Socks5Proxy, completion: *const linux.io_uring_cqe) void {
+        const operation: *Operation = @ptrFromInt(completion.user_data);
+        assert(operation.* == .connect);
+        assert(operation.connect.socket > 2);
+        assert(operation.connect.timeout.ts.sec > 0 or operation.connect.timeout.ts.nsec > 0);
+        assert(operation.connect.timeout.flags != 0);
+
+        const connection: *Connection = @alignCast(@fieldParentPtr("inflight_operation", operation));
+        const is_pending_client = self.pending_clients.contains(connection.socket);
+        const is_active_session = self.active_sessions.contains(connection.session_id);
+        assert(is_active_session != is_pending_client);
+
+        assert(completion.res <= 0);
+        const result: ?OsError = if (completion.res == 0) null else io_utils.io_uring_error(completion.res);
+
+        if (result) |err| {
+            switch (connection.negotiated_command) {
+                .connect => {
+                    std.log.debug("client(ip={d}, port={d}): failed connection to server(ip={d}, port={d}) due to error: {any}", .{
+                        connection.remote_ip_address(),
+                        connection.port(),
+                        net.ip_address_from_posix_address(&operation.connect.address),
+                        net.port_from_posix_address(&operation.connect.address),
+                        err,
+                    });
+                    const server_socket = operation.connect.socket;
+                    assert(is_pending_client);
+                    assert(connection.kind == .client_tcp);
+                    assert(connection.state == .command_negotiation);
+                    assert(connection.socket != server_socket);
+                    defer {
+                        assert(connection.socket == server_socket);
+                        assert(connection.state == .terminating_with_reply);
+                        assert(connection.state.terminating_with_reply != .success);
+                        assert(connection.state.terminating_with_reply != .command_not_supported);
+                        assert(connection.state.terminating_with_reply != .address_type_not_supported);
+                    }
+                    switch (err) {
+                        error.INTR, error.PROTOTYPE, error.BADF, error.ALREADY => unreachable,
+                        error.ISCONN, error.NOTSOCK, error.FAULT, error.AFNOSUPPORT => unreachable,
+
+                        // NOTE: This errno may or may not indicate failure, read the man page for connect(2) for more information.
+                        // This errno can only appear for non blocking sockets, or for connect(2) SQEs with the IOSQE_ASYNC flag being set.
+                        error.INPROGRESS => unreachable,
+
+                        // We neither use UNIX domain sockets nor a linux version which can encounter a routing cache error.
+                        error.AGAIN => unreachable,
+
+                        // NOTE(EADDRINUSE): Although this errno is documented in the man page for connect(2)
+                        // it is almost a certainty that it's not going to show up.
+                        error.ADDRINUSE, error.ADDRNOTAVAIL, error.ACCES, error.PERM => self.enqueue_connection_reply_for_termination(connection, .socks_server_failure),
+
+                        // NOTE: We enqueue a reply, and immediately store the server's socket in the client's socket field.
+                        // The reason we do this is to avoid adding more state than necessary. In the send's callback
+                        // we must check whether the connection.socket is the same as the send_operation.socket to know
+                        // whether it must be closed as well.
+                        error.CONNREFUSED, error.CONNRESET => self.enqueue_connection_reply_for_termination(connection, .connection_refused),
+
+                        error.TIMEDOUT, error.CANCELED => self.enqueue_connection_reply_for_termination(connection, .ttl_expired),
+                        error.NETUNREACH => self.enqueue_connection_reply_for_termination(connection, .network_unreachable),
+                        error.HOSTUNREACH => self.enqueue_connection_reply_for_termination(connection, .host_unreachable),
+                        else => self.enqueue_connection_reply_for_termination(connection, .socks_server_failure),
+                    }
+                    // NOTE(important): This is a bit of a hack to not have to create another field to store the non-connected server socket.
+                    // We send a reply with the reason for termination, and swap out the socket field. The Connection.inflight_operation
+                    // will then contain the client's socket, while Connection.socket will contain the server's. On send CQE we can swap them again.
+                    // Lookup server_socket_was_created to see how we reset the Connection's socket and continue the termination process.
+                    connection.socket = server_socket;
+                },
+
+                // TODO: Should UDP connect ever fail ?
+                .udp_associate => unreachable, // TODO(UDP)
+                else => unreachable,
+            }
+            return;
+        }
+
+        switch (connection.negotiated_command) {
+            .connect => {
+                const server_socket = operation.connect.socket;
+                assert(is_pending_client);
+                assert(connection.kind == .client_tcp);
+                assert(connection.state == .command_negotiation);
+                assert(connection.state.command_negotiation == 0);
+                assert(connection.socket != server_socket);
+
+                const buffer_ptr = self.buffer_pool.get_array_ptr_assume_capacity();
+                const server_connection = Connection{
+                    .kind = .server_tcp,
+                    .negotiated_auth_method = connection.negotiated_auth_method,
+                    .negotiated_command = connection.negotiated_command,
+                    .socket = server_socket,
+                    .buffer_ptr = buffer_ptr,
+                    .established_at_ns = self.time.monotonic_clock(),
+                    .traffic_stats = .{},
+                    .session_id = connection.session_id,
+
+                    // Server starts in the .transferring state right away but we don't start reading bytes just yet.
+                    .state = .transferring,
+
+                    .remote_address = operation.connect.address,
+                    .inflight_operation = undefined,
+                };
+                assert(!self.pending_clients.contains(server_connection.socket));
+                assert(!self.active_sessions.contains(server_connection.session_id));
+
+                // NOTE(IMPORTANT): It is necessary to copy the Connection here before removing it from the hashmap,
+                // since the remove() function will overwrite the value.
+                var client_connection: Connection = connection.*;
+                assert(self.pending_clients.remove(client_connection.socket));
+
+                // NOTE: We don't set the transferring state just yet.
+                // We wait for tcp send callback to run and check that command_negotiation state is active and then transition.
+                // client_connection.state = .transferring;
+
+                self.active_sessions.putAssumeCapacity(
+                    server_connection.session_id,
+                    Session{
+                        .connect = .{
+                            .client_tcp_data_plane = client_connection,
+                            .server_tcp_data_plane = server_connection,
+                        },
+                    },
+                );
+
+                std.log.info("established_session(id={d}, client(ip={d}, port={d}), server(ip={d}, port={d})).", .{
+                    server_connection.session_id,
+                    client_connection.remote_ip_address(),
+                    client_connection.port(),
+
+                    server_connection.remote_ip_address(),
+                    server_connection.port(),
+                });
+
+                const session: *Session = self.active_sessions.getPtr(server_connection.session_id).?;
+                session.assert_invariants();
+                assert(session.* == .connect);
+
+                switch (client_connection.negotiated_auth_method) {
+                    .none, .credentials => { // No wrapping required, just plain send.
+                        const send_flags = 0;
+                        const no_timeout = null; // TODO: Maybe timeout?
+                        self.enqueue_socket_send(
+                            &session.connect.client_tcp_data_plane.inflight_operation,
+                            session.connect.client_tcp_data_plane.socket,
+                            command_negotiation_success_reply_for_connect[0..],
+                            send_flags,
+                            no_timeout,
+                        );
+                    },
+                    else => unreachable, // We don't (and won't) support other auth methods.
+                }
+            },
+            // TODO(UDP): command_negotiation_success_reply_for_udp_associate must be copied into buffer_ptr since it's dynamic
+            .udp_associate => unreachable,
+            else => unreachable,
+        }
+    }
+
+    pub fn handle_close(self: *Socks5Proxy, completion: *const linux.io_uring_cqe) void {
         const operation: *Operation = @ptrFromInt(completion.user_data);
         assert(operation.* == .close);
-        assert(operation.close.fd >= 0);
+        assert(operation.close.fd > 2);
 
         assert(completion.res <= 0);
         const result: ?OsError = if (completion.res == 0) null else io_utils.io_uring_error(completion.res);
@@ -938,8 +1383,10 @@ const Socks5Proxy = struct {
                 error.NOSPC => unreachable,
                 error.DQUOT => unreachable,
                 error.IO => unreachable,
-                else => std.log.warn("close: unknown error encountered: {any} for operation: {any}", .{ err, operation.* }),
+                error.CANCELED => unreachable,
+                else => std.log.warn("close: unknown error encountered: {any} for fd {d}", .{ err, operation.close.fd }),
             }
+            // TODO: Figure out which errors could be caught here and handle them.
             if (err != error.INTR) {
                 return;
             }
@@ -955,76 +1402,135 @@ const Socks5Proxy = struct {
         }
 
         const connection: *Connection = @alignCast(@fieldParentPtr("inflight_operation", operation));
-        assert(connection.state == .terminating or connection.state == .terminating_with_reply);
+        // It could be that this `connection`'s inflight_operation is used to close the opposing connection.
+        assert(connection.state == .terminated or
+            connection.state == .terminating or
+            (connection.state == .terminating_with_reply and connection.state.terminating_with_reply != .success));
 
-        // should be mirrored with a get_array_ptr_assume_capacity during connection creation.
-        self.buffer_pool.put(connection.buffer_ptr);
-        connection.state = .terminated;
+        const is_terminating_session = connection.state == .terminated or
+            (connection.state == .terminating and connection.state.terminating == .transferring);
 
-        const active_session = self.active_sessions.getPtr(connection.session_id);
-        if (active_session) |session| {
-            // NOTE: this is safe: the close will be handled before the next fd returned by accept(2) is put in the pending_clients.
-            assert(!self.pending_clients.contains(connection.socket));
+        if (is_terminating_session) {
+            const closed_fd = operation.close.fd;
+            const is_socket_owner = connection.socket == closed_fd;
+
+            const session: *Session = self.active_sessions.getPtr(connection.session_id).?;
+            session.assert_invariants();
 
             switch (session.*) {
-                .connect => {
-                    switch (connection.kind) {
-                        .client_tcp => assert(connection == &session.connect.client_tcp_data_plane),
-                        .server_tcp => assert(connection == &session.connect.server_tcp_data_plane),
-                        else => unreachable,
-                    }
-                    if (session.connect.client_tcp_data_plane.state != .terminated) {
-                        // Ensure that the other side also started the closing down process.
-                        assert(session.connect.server_tcp_data_plane.inflight_operation == .close);
-                    }
-                    if (session.connect.server_tcp_data_plane.state != .terminated) {
-                        assert(session.connect.client_tcp_data_plane.inflight_operation == .close);
-                    }
-                    if (session.connect.client_tcp_data_plane.state == .terminated and
-                        session.connect.server_tcp_data_plane.state == .terminated)
-                    {
-                        // At this point, nothing remains. All the buffers have been put back in the pool.
-                        // And the session has been deleted and file descriptors closed.
-                        assert(self.active_sessions.remove(connection.session_id));
+                .connect => |*connect_session| {
+                    const client_connection: *Connection = &connect_session.client_tcp_data_plane;
+                    const server_connection: *Connection = &connect_session.server_tcp_data_plane;
+                    assert(connection == client_connection or connection == server_connection);
+
+                    const opposing_connection = if (connection == client_connection)
+                        server_connection
+                    else if (connection == server_connection)
+                        client_connection
+                    else
+                        unreachable;
+
+                    if (is_socket_owner) {
+                        assert(connection.state == .terminating and connection.state.terminating == .transferring);
+                        assert(opposing_connection.state == .terminating and opposing_connection.state.terminating == .transferring);
+                        connection.state = .terminated;
+                        self.enqueue_close(&connection.inflight_operation, opposing_connection.socket);
+                    } else {
+                        assert(connection.state == .terminated);
+                        assert(opposing_connection.state == .terminating and opposing_connection.state.terminating == .transferring);
+
+                        const is_last_cqe = opposing_connection.inflight_operation == .nop;
+                        if (is_last_cqe) {
+                            @branchHint(.likely);
+                            opposing_connection.state = .terminated;
+                            self.stop_proxying(session);
+                        } else {
+                            // NOTE: I purposefuly put this line in both branches to make sure that it is understood
+                            // that this state is used to coordinate out of order close/send/recv CQEs.
+                            //
+                            // It will be used by recv/send callbacks to decide whether session must be torn down.
+                            // It is however extremely unlikely for this CQE reordering to occur here.
+                            opposing_connection.state = .terminated;
+
+                            assert(opposing_connection.inflight_operation == .send or opposing_connection.inflight_operation == .recv);
+                            std.log.warn("session(client(ip={d}, port={d}), server(ip={d}, port={d})): close cqe before send/recv cqe.", .{
+                                client_connection.remote_ip_address(),
+                                client_connection.port(),
+
+                                server_connection.remote_ip_address(),
+                                server_connection.port(),
+                            });
+                        }
                     }
                 },
-                .udp_associate => {
-                    switch (connection.kind) {
-                        .server_udp => {
-                            if (builtin.mode == .Debug or builtin.mode == .ReleaseSafe) {
-                                const exists = exists: for (session.udp_associate.udp_destinations.items) |*destination| {
-                                    if (destination == connection)
-                                        break :exists true;
-                                } else false;
-                                assert(exists);
-                            }
-                        },
-                        .client_udp => assert(connection == &session.udp_associate.client_udp_data_plane),
-                        .client_tcp => assert(connection == &session.udp_associate.client_tcp_control_plane),
-                        else => unreachable,
-                    }
-                    assert(session.udp_associate.client_udp_data_plane.inflight_operation == .close);
-                    assert(session.udp_associate.client_tcp_control_plane.inflight_operation == .close);
 
-                    // Means that all close handlers have run (includes the current function).
-                    var all_terminated = true;
-                    for (session.udp_associate.udp_destinations.items) |*udp_connection| {
-                        assert(udp_connection.inflight_operation == .close);
-                        if (udp_connection.state != .terminated)
-                            all_terminated = false;
-                    }
-
-                    if (all_terminated) {
-                        // TODO: free the udp_destinations.
-                    }
-                },
+                .udp_associate => |*udp_associate_session| {
+                    std.log.warn("handle_close: must be implemented for udp_associate.", .{});
+                    _ = &udp_associate_session;
+                }, // TODO: udp associate
             }
-        } else {
-            // TODO:
+            return;
+        }
+
+        switch (connection.state) {
+            .auth_method_negotiation, .command_negotiation => {
+                if (connection.state == .command_negotiation)
+                    assert(connection.negotiated_auth_method != .none);
+
+                // We could either be in the auth_method_negotiation still,
+                // or have yet to finish the command_negotiation for this field to have a different value.
+                maybe(connection.negotiated_command == .none);
+
+                assert(connection.socket == operation.close.fd);
+                // NOTE: We expect the close CQE to show up first before an accept returns the same fd as this Connection's.
+                assert(!self.active_sessions.contains(connection.session_id));
+
+                std.log.debug("client(ip={d}, port={d}, state={any}): removed from pending_clients.", .{ connection.remote_ip_address(), connection.port(), connection.state });
+                self.buffer_pool.put(connection.buffer_ptr);
+                assert(self.pending_clients.remove(connection.socket));
+            },
+
+            .terminating_with_reply => |reply| {
+                assert(reply != .success);
+                maybe(connection.socket == operation.close.fd);
+                assert(!self.active_sessions.contains(connection.session_id));
+                const is_server_socket_being_closed = connection.socket != operation.close.fd;
+                if (is_server_socket_being_closed) {
+                    const server_socket = operation.close.fd;
+                    assert(!self.pending_clients.contains(server_socket));
+                    assert(self.pending_clients.contains(connection.socket));
+                    self.enqueue_connection_close(connection);
+                } else {
+                    std.log.debug("client(ip={d}, port={d}, state={any}): removed from pending_clients.", .{ connection.remote_ip_address(), connection.port(), connection.state });
+                    self.buffer_pool.put(connection.buffer_ptr);
+                    assert(self.pending_clients.remove(connection.socket));
+                }
+            },
+
+            .terminating => |phase| {
+                assert(phase != .transferring);
+                assert(connection.socket == operation.close.fd);
+                assert(!self.active_sessions.contains(connection.session_id));
+                std.log.debug("client(ip={d}, port={d}, state={any}): removed from pending_clients.", .{ connection.remote_ip_address(), connection.port(), connection.state });
+                self.buffer_pool.put(connection.buffer_ptr);
+                assert(self.pending_clients.remove(connection.socket));
+            },
+
+            // Both terminated and terminating.transferring are handled earlier.
+            .terminated => unreachable,
+
+            else => {
+                // TODO: handle remaining states: awaiting_udp_message
+                std.log.warn("client(ip={d}, port={d}, state={any}): no handler for close.", .{
+                    connection.remote_ip_address(),
+                    connection.port(),
+                    connection.state,
+                });
+            },
         }
     }
 
-    pub fn handle_send(self: *Socks5Proxy, completion: *linux.io_uring_cqe) void {
+    pub fn handle_send(self: *Socks5Proxy, completion: *const linux.io_uring_cqe) void {
         const operation: *Operation = @ptrFromInt(completion.user_data);
         assert(operation.* == .send);
         assert(operation.send.socket > 2);
@@ -1040,77 +1546,446 @@ const Socks5Proxy = struct {
         }
     }
 
-    pub fn handle_server_tcp_send(self: *Socks5Proxy, connection: *Connection, completion: *linux.io_uring_cqe) void {
-        // TODO:DO
-        _ = &self;
-        _ = &completion;
+    pub fn handle_server_tcp_receive(self: *Socks5Proxy, connection: *Connection, completion: *const linux.io_uring_cqe) void {
         assert(connection.kind == .server_tcp);
+        const operation: *Operation = @ptrFromInt(completion.user_data);
+        assert(operation.* == .recv);
+        assert(operation.recv.socket > 2);
+        assert(operation.recv.buffer.len > 0);
+        assert(operation.recv.timeout == null);
+
+        assert(connection.socket == operation.recv.socket);
+        assert(connection.state == .transferring or
+            connection.state == .terminated or
+            (connection.state == .terminating and connection.state.terminating == .transferring));
+
+        const session: *Session = self.active_sessions.getPtr(connection.session_id).?;
+        session.assert_invariants();
+        assert(session.* == .connect);
+
+        const client_connection: *Connection = &session.connect.client_tcp_data_plane;
+        const server_connection: *Connection = &session.connect.server_tcp_data_plane;
+        assert(connection == server_connection);
+
+        const session_terminating_or_terminated =
+            connection.state == .terminated or (connection.state == .terminating and connection.state.terminating == .transferring);
+
+        if (session_terminating_or_terminated) {
+            if (server_connection.state == .terminated) {
+                assert(client_connection.state == .terminated);
+                maybe(self.pending_clients.contains(server_connection.socket));
+                maybe(self.pending_clients.contains(client_connection.socket));
+            } else {
+                // As long as the close callback has not executed (state set to .terminated), then the socket has not been reused elsewhere.
+                // The close CQE for a given socket fd is guaranteed to appear before the accept/connect CQE returns the same fd.
+                assert(!self.pending_clients.contains(server_connection.socket));
+                assert(client_connection.state == .terminated or
+                    (client_connection.state == .terminating and client_connection.state.terminating == .transferring));
+            }
+            const is_last_cqe = server_connection.state == .terminated;
+            if (!is_last_cqe) {
+                @branchHint(.likely);
+                connection.inflight_operation = .{ .nop = {} };
+            } else {
+                self.stop_proxying(session);
+            }
+            return;
+        }
+
+        assert(connection.state == .transferring);
+
+        const result: OsError!usize = if (completion.res < 0) io_utils.io_uring_error(completion.res) else @intCast(completion.res);
+        if (result) |bytes_received| {
+            const hit_eof = bytes_received == 0;
+            if (!hit_eof) {
+                std.log.debug("server(ip={d}, port={d}): recv bytes: {d}.", .{ server_connection.remote_ip_address(), server_connection.port(), bytes_received });
+                const send_flags = 0;
+                const no_timeout = null;
+                self.enqueue_socket_send(
+                    &server_connection.inflight_operation,
+                    client_connection.socket,
+                    server_connection.buffer_ptr[0..bytes_received],
+                    send_flags,
+                    no_timeout,
+                );
+            } else {
+                @branchHint(.unlikely);
+                std.log.debug("server(ip={d}, port={d}): encountered eof. starting session teardown.", .{
+                    server_connection.remote_ip_address(),
+                    server_connection.port(),
+                });
+                defer assert((client_connection.state == .terminating and client_connection.state.terminating == .transferring) and
+                    (server_connection.state == .terminating and server_connection.state.terminating == .transferring));
+
+                assert(!self.pending_clients.contains(client_connection.socket));
+                assert(!self.pending_clients.contains(server_connection.socket));
+
+                client_connection.state = .{ .terminating = .transferring };
+                server_connection.state = .{ .terminating = .transferring };
+                self.enqueue_shutdown(
+                    &server_connection.inflight_operation,
+                    client_connection.socket,
+                );
+            }
+        } else |err| {
+            switch (err) {
+                error.AGAIN, error.BADF, error.INTR, error.INVAL, error.CONNRESET => unreachable,
+                error.NOTCONN, error.NOTSOCK, error.OPNOTSUPP, error.TIMEDOUT, error.IO => unreachable,
+
+                error.NOBUFS, error.NOMEM => {
+                    std.log.warn("server(ip={d}, port={d}): no system resources when receiving data: {any}.", .{
+                        server_connection.remote_ip_address(),
+                        server_connection.port(),
+                        err,
+                    });
+                    const no_timeout = null;
+                    self.enqueue_socket_recv(
+                        &connection.inflight_operation,
+                        operation.recv.socket,
+                        operation.recv.buffer,
+                        operation.recv.flags,
+                        no_timeout,
+                    );
+                },
+
+                else => {
+                    std.log.warn("server(ip={d}, port={d}): encountered unexpected error when receiving data {any}. start session teardown.", .{
+                        server_connection.remote_ip_address(),
+                        server_connection.port(),
+                        err,
+                    });
+
+                    assert(!self.pending_clients.contains(client_connection.socket));
+                    assert(!self.pending_clients.contains(server_connection.socket));
+
+                    client_connection.state = .{ .terminating = .transferring };
+                    server_connection.state = .{ .terminating = .transferring };
+                    self.enqueue_shutdown(
+                        &server_connection.inflight_operation,
+                        client_connection.socket,
+                    );
+                },
+            }
+        }
     }
 
-    pub fn handle_client_tcp_send(self: *Socks5Proxy, connection: *Connection, completion: *linux.io_uring_cqe) void {
+    pub fn handle_server_tcp_send(self: *Socks5Proxy, connection: *Connection, completion: *const linux.io_uring_cqe) void {
+        assert(connection.kind == .server_tcp);
+        const operation: *Operation = @ptrFromInt(completion.user_data);
+        assert(operation == &connection.inflight_operation);
+        assert(operation.* == .send);
+        assert(operation.send.socket > 2);
+        assert(operation.send.buffer.len > 0);
+        assert(operation.send.timeout == null); // No timeout when sending to clients.
+
+        // All of server_tcp sends are directed to the client socket.
+        assert(connection.socket != operation.send.socket);
+
+        // Only three possible states
+        assert(connection.state == .transferring or
+            connection.state == .terminated or
+            (connection.state == .terminating and connection.state.terminating == .transferring));
+
+        // The session must exist for the server's send to happen.
+        const session: *Session = self.active_sessions.getPtr(connection.session_id).?;
+        session.assert_invariants();
+        assert(session.* == .connect);
+
+        const client_connection: *Connection = &session.connect.client_tcp_data_plane;
+        const server_connection: *Connection = &session.connect.server_tcp_data_plane;
+        assert(connection == server_connection);
+        assert(client_connection.socket == operation.send.socket);
+
+        const session_terminating_or_terminated =
+            connection.state == .terminated or (connection.state == .terminating and connection.state.terminating == .transferring);
+
+        if (session_terminating_or_terminated) {
+            if (server_connection.state == .terminated) {
+                assert(client_connection.state == .terminated);
+                maybe(self.pending_clients.contains(server_connection.socket));
+                maybe(self.pending_clients.contains(client_connection.socket));
+            } else {
+                // As long as the close callback has not executed (state set to .terminated), then the socket has not been reused elsewhere.
+                // The close CQE for a given socket fd is guaranteed to appear before the accept/connect CQE returns the same fd.
+                assert(!self.pending_clients.contains(server_connection.socket));
+                assert(client_connection.state == .terminated or
+                    (client_connection.state == .terminating and client_connection.state.terminating == .transferring));
+            }
+
+            const is_last_cqe = server_connection.state == .terminated;
+            if (!is_last_cqe) {
+                @branchHint(.likely);
+                connection.inflight_operation = .{ .nop = {} };
+            } else {
+                self.stop_proxying(session);
+            }
+            return;
+        }
+
+        assert(connection.state == .transferring);
+
+        const result: OsError!usize = if (completion.res < 0)
+            io_utils.io_uring_error(completion.res)
+        else
+            @intCast(completion.res);
+
+        if (result) |bytes_sent| {
+            std.log.debug("server(ip={d}, port={d}): sent bytes: {d}.", .{ connection.remote_ip_address(), connection.port(), bytes_sent });
+            // TODO: increment tcp short write counter.
+            const is_short_write = bytes_sent < operation.send.buffer.len;
+            const no_timeout = null;
+            if (is_short_write) {
+                self.enqueue_socket_send(
+                    &connection.inflight_operation,
+                    operation.send.socket,
+                    operation.send.buffer[bytes_sent..],
+                    operation.send.flags,
+                    no_timeout,
+                );
+            } else {
+                const recv_flags = 0;
+                self.enqueue_socket_recv(
+                    &connection.inflight_operation,
+                    connection.socket,
+                    connection.buffer_ptr[0..],
+                    recv_flags,
+                    no_timeout,
+                );
+            }
+        } else |err| {
+            switch (err) {
+                // NOTE: We never use timeouts for server sends, and the cancelation should prevent us from running the current callback.
+                error.CANCELED => unreachable,
+
+                error.NOTSOCK, error.OPNOTSUPP => unreachable,
+                error.ISCONN, error.MSGSIZE, error.NOTCONN => unreachable,
+                error.ACCES, error.AGAIN, error.ALREADY, error.BADF => unreachable,
+                error.DESTADDRREQ, error.FAULT, error.INTR, error.INVAL => unreachable,
+
+                error.NOBUFS, error.NOMEM => {
+                    std.log.debug("server(ip={d}, port={d}): encountered system resources problem on send: {any}.", .{
+                        server_connection.remote_ip_address(),
+                        server_connection.port(),
+                        err,
+                    });
+                    const no_timeout = null;
+                    self.enqueue_socket_send(
+                        &server_connection.inflight_operation,
+                        operation.send.socket,
+                        operation.send.buffer,
+                        operation.send.flags,
+                        no_timeout,
+                    );
+                },
+                else => {
+                    if (err == error.PIPE or err == error.CONNRESET) {
+                        std.log.debug("server(ip={d}, port={d}): peer reset error {any} during send.", .{
+                            server_connection.remote_ip_address(),
+                            server_connection.port(),
+                            err,
+                        });
+                    } else {
+                        std.log.warn("server(ip={d}, port={d}): encountered unexpected error during send: {any}.", .{
+                            server_connection.remote_ip_address(),
+                            server_connection.port(),
+                            err,
+                        });
+                    }
+
+                    assert(!self.pending_clients.contains(client_connection.socket));
+                    assert(!self.pending_clients.contains(server_connection.socket));
+
+                    client_connection.state = .{ .terminating = .transferring };
+                    server_connection.state = .{ .terminating = .transferring };
+                    self.enqueue_shutdown(
+                        &server_connection.inflight_operation,
+                        client_connection.socket,
+                    );
+                },
+            }
+        }
+    }
+
+    pub fn handle_client_tcp_send(self: *Socks5Proxy, connection: *Connection, completion: *const linux.io_uring_cqe) void {
         assert(connection.kind == .client_tcp);
         const operation: *Operation = @ptrFromInt(completion.user_data);
+        assert(operation == &connection.inflight_operation);
+        assert(operation.* == .send);
 
         // Depending on the state of the client's connection, the inflight_operation might be used
         // to send data to either the client's own socket, or the server's socket.
         // We ensure that no misdirected send happens depending on this state.
         switch (connection.state) {
-            .awaiting_udp_message => assert(true), // TODO
+            .awaiting_udp_message => unreachable, // TODO(UDP)
 
             // All sends before session establishement are directed towards the Connection's own socket.
-            .auth_method_negotiation, .auth_sub_negotiation, .command_negotiation, .terminating_with_reply => assert(connection.socket == operation.send.socket),
+            .auth_method_negotiation, .auth_sub_negotiation, .command_negotiation => assert(connection.socket == operation.send.socket),
+
+            .terminating_with_reply => |reply| switch (reply) {
+                // These errors are sent before server_socket creation and an attempt to make a connection to the server.
+                .success, .command_not_supported, .address_type_not_supported => assert(connection.socket == operation.send.socket),
+
+                // These are sent after server_socket was created and an attempt to make a connection has been made.
+                // Since we send the reply and overwrite the client Connection's socket with the server_socket to avoid
+                // storing more state, then the connection's socket won't match the one we are sending a reply to.
+                .ruleset_violation, .network_unreachable, .host_unreachable, .connection_refused, .ttl_expired => assert(connection.socket != operation.send.socket),
+
+                // Catch all error which can be used before or after server_socket creation.
+                // Before in the case where socket creation fails.
+                // After in the case where socket creation succeeds but the connect(2) fails.
+                .socks_server_failure => maybe(connection.socket == operation.send.socket),
+            },
 
             // If we are terminating the transferring phase (which is when the session has been established)
             // then all the Connection's inflight sends are directed to its peer (the server in this instance).
             .terminating => |phase| switch (phase) {
                 .transferring => {
                     const session: *Session = self.active_sessions.getPtr(connection.session_id).?;
-                    assert(session.* == .connect); // No BIND.
+                    session.assert_invariants();
 
-                    assert(connection == &session.connect.client_tcp_data_plane);
-                    assert(operation.send.socket == session.connect.server_tcp_data_plane.socket);
+                    switch (session.*) {
+                        .connect => |*connect_session| {
+                            std.log.warn("session(client(ip={d}, port={d}), server(ip={d}, port={d})): close cqe before send/recv cqe.", .{
+                                connection.remote_ip_address(),
+                                connection.port(),
+
+                                session.connect.server_tcp_data_plane.remote_ip_address(),
+                                session.connect.server_tcp_data_plane.port(),
+                            });
+
+                            assert(connection == &connect_session.client_tcp_data_plane);
+                            assert(connection.socket != operation.send.socket);
+                        },
+                        .udp_associate => unreachable, // TODO(UDP)
+                    }
                 },
                 .auth_method_negotiation, .auth_sub_negotiation, .command_negotiation => assert(connection.socket == operation.send.socket),
             },
+
             .terminated, .transferring => {
                 const session: *Session = self.active_sessions.getPtr(connection.session_id).?;
-                assert(&session.connect.client_tcp_data_plane == connection);
-                assert(operation.send.socket == session.connect.server_tcp_data_plane.socket);
+
+                // TODO(IMPORTANT): Revisit when implementing udp associate.
+                switch (session.*) {
+                    .connect => |*connect_session| {
+                        assert(connection == &connect_session.client_tcp_data_plane);
+                        assert(connection.socket != operation.send.socket);
+                        
+                    },
+                    .udp_associate => |*udp_associate_session| {
+                        _ = &udp_associate_session;
+                    },
+                }
             },
         }
 
-        // Allow the first peer to encounter an error to shutdown(2) and close(2) both sockets.
-        // Starting with its peer's socket, and then its own.
-        // So an error in send(client_socket) issued by the server will result in the following:
-        // 1) shutdown(client_socket) + client_conn.state = server_conn.state = .terminating.
-        // this shutdown may end up canceling any inflight recv(client_socket) issued by the client, but not the send(server_socket).
-        // 2) on shutdown_sqe(client_socket), call shutdown(server_socket), which will cancel any inflight send(server_socket).
-        // TODO: document close(2)
-        const session_exists_and_is_terminating = connection.state == .terminating and connection.state.terminating == .transferring;
-        if (session_exists_and_is_terminating) {
+        const session_terminating_or_terminated: bool =
+            connection.state == .terminated or (connection.state == .terminating and connection.state.terminating == .transferring);
+
+        if (session_terminating_or_terminated) {
             const session: *Session = self.active_sessions.getPtr(connection.session_id).?;
-            assert(session.* == .connect); // No bind
-            assert(&session.connect.client_tcp_data_plane == connection);
+            assert(session.* == .connect); // TODO(IMPORTANT): Revisit when implementing udp associate.
+            session.assert_invariants();
+            assert(connection == &session.connect.client_tcp_data_plane);
+
             const server_connection: *Connection = &session.connect.server_tcp_data_plane;
-            assert(operation.send.socket == server_connection.socket);
-            assert(server_connection.state == .terminating or server_connection.state == .terminated);
+            assert(connection.socket != server_connection.socket);
+            assert(server_connection.state == .terminated or
+                (server_connection.state == .terminating and server_connection.state.terminating == .transferring));
+
+            // This state indicates that the server closed its socket and issued a close on connection.close.
+            // If not set then we may safely assert that no new client has been assigned the same socket fd as `connection`.
+            const server_terminated = server_connection.state == .terminated;
+            if (!server_terminated) {
+                assert(connection.state != .terminated);
+                assert(!self.pending_clients.contains(connection.socket));
+            } else {
+                maybe(self.pending_clients.contains(connection.socket));
+            }
+
+            // NOTE: This may be the last CQE we see, if so, its handler must take care of session clean up.
+            // Otherwise, we simply set the inflight_operation to `nop` to signal to the subsequent CQEs that
+            // it is safe to teardown resources associated with the connection. The risk we run in not coordinating
+            // the session teardown is that the session can be freed before the Connection runs its callback.
+            // So when we receive an CQE for one of its operations we would access freed memory.
+            const is_last_cqe = connection.state == .terminated;
+            if (!is_last_cqe) {
+                @branchHint(.likely);
+                connection.inflight_operation = .{ .nop = {} };
+            } else {
+                self.stop_proxying(session);
+            }
             return;
         }
 
-        const result: OsError!usize = if (completion.res < 0) io_utils.io_uring_error(completion.res) else @intCast(completion.res);
+        const result: OsError!usize = if (completion.res < 0)
+            io_utils.io_uring_error(completion.res)
+        else
+            @intCast(completion.res);
+
         if (result) |bytes_sent| {
-            // Not entirely related to send(2), but the UDP payload can be 0 bytes in size.
-            // But socks5 has a header per udp packet which makes this case impossible when sending to the client.
+            std.log.debug("client(ip={d}, port={d}, state={any}): sent bytes: {d}.", .{
+                connection.remote_ip_address(),
+                connection.port(),
+                connection.state,
+                bytes_sent,
+            });
+            // NOTE: Not entirely related to send(2), but the UDP payload can be 0 bytes in size.
+            // However socks5 has a header per udp message which makes this case impossible when sending to the client.
+            // So it must be asserted in the udp path that the udp message is at least sizeof(udp_header).
             assert(bytes_sent > 0);
             switch (connection.state) {
+                // Once the client sends us the command negotiation request and we establish a connection
+                // to the server, we create the session then send the success reply to the client.
+                // TODO: This sent bytes tracking stuff is not needed at all:
+                // We can simply compare the `operation.send.buffer.len` with the `bytes_sent` to know if the send was short.
+                .command_negotiation => |bytes_so_far| {
+                    assert(connection.negotiated_command != .none);
+                    const total_command_negotiation_bytes_sent: usize = bytes_sent + bytes_so_far;
+                    assert(total_command_negotiation_bytes_sent <= command_negotiation_success_ipv4_reply_message_size);
+                    assert(!self.pending_clients.contains(connection.socket));
+                    assert(self.active_sessions.contains(connection.session_id));
+
+                    const sent_all_command_reply_bytes = bytes_sent == operation.send.buffer.len;
+                    defer {
+                        if (sent_all_command_reply_bytes) {
+                            assert(connection.state == .transferring);
+                            assert(total_command_negotiation_bytes_sent == command_negotiation_success_ipv4_reply_message_size);
+                        } else {
+                            assert(connection.state == .command_negotiation);
+                            assert(connection.state.command_negotiation == total_command_negotiation_bytes_sent);
+                        }
+                    }
+                    const session: *Session = self.active_sessions.getPtr(connection.session_id).?;
+                    if (sent_all_command_reply_bytes) {
+                        @branchHint(.likely);
+                        connection.state = .transferring;
+                        self.start_proxying(session);
+                    } else {
+                        connection.state.command_negotiation += @intCast(bytes_sent);
+                        assert(operation.send.buffer[bytes_sent..].len > 0);
+                        self.enqueue_socket_send(
+                            &connection.inflight_operation,
+                            operation.send.socket,
+                            operation.send.buffer[bytes_sent..],
+                            operation.send.flags,
+                            if (operation.send.timeout) |timeout|
+                                .{ .ts = timeout.ts, .flags = timeout.flags }
+                            else
+                                null,
+                        );
+                    }
+                },
+
                 .auth_method_negotiation => |bytes_so_far| {
                     const auth_method_index = std.mem.findScalar(AuthMethod, &available_auth_methods, connection.negotiated_auth_method);
                     assert(auth_method_index != null);
                     assert(connection.negotiated_command == .none);
 
-                    const total_auth_negotiation_bytes_sent = bytes_so_far + bytes_sent;
+                    const total_auth_negotiation_bytes_sent: usize = bytes_so_far + bytes_sent;
                     assert(total_auth_negotiation_bytes_sent <= auth_method_negotiation_reply_message_size);
 
+                    // NOTE: This can also be: bytes_sent == operation.send.buffer.len
                     const sent_all_auth_reply_bytes = total_auth_negotiation_bytes_sent == auth_method_negotiation_reply_message_size;
                     defer {
                         // State either changed, or remained the same but the bytes sent were incremented.
@@ -1123,10 +1998,6 @@ const Socks5Proxy = struct {
                     if (sent_all_auth_reply_bytes) {
                         @branchHint(.likely);
                         switch (connection.negotiated_auth_method) {
-                            // TODO
-                            .tls => {
-                                connection.state = .{ .auth_sub_negotiation = 0 };
-                            },
                             // TODO:
                             // Requires implementing (or stealing) an SPMC for the `io_ring` owning thread
                             // to delegate the hashing to the many consumer threads.
@@ -1171,24 +2042,25 @@ const Socks5Proxy = struct {
                     } else {
                         connection.state.auth_method_negotiation += @intCast(bytes_sent);
                         assert(operation.send.buffer[bytes_sent..].len > 0);
-
-                        const send_flags = 0;
-                        const no_timeout = null;
                         self.enqueue_socket_send(
                             &connection.inflight_operation,
                             connection.socket,
                             operation.send.buffer[bytes_sent..],
-                            send_flags,
-                            no_timeout,
+                            operation.send.flags,
+                            if (operation.send.timeout) |timeout| .{
+                                .ts = timeout.ts,
+                                .flags = timeout.flags,
+                            } else null,
                         );
                     }
                 },
-                .terminating => |connection_phase| {
-                    switch (connection_phase) {
+
+                .terminating => |phase| {
+                    switch (phase) {
                         // NOTE: We don't care about short writes here. They are extremely unlikely to occur in any case since both
                         // `unacceptable_auth_method_reply_message` and `credentials_sub_negotiation_failure_reply_message` are 2 bytes each
                         // and because we close the connection right afterwards anyways.
-                        // I'm *almost* tempted to assert on the `bytes_sent` being equal to the length of either of those...
+                        // I'm *almost* tempted to assert on the `bytes_sent` being equal to the length of either of those messages...
                         .auth_method_negotiation => {
                             assert(operation.send.buffer.ptr == &unacceptable_auth_method_reply_message);
                             if (bytes_sent < unacceptable_auth_method_reply_message.len) {
@@ -1211,70 +2083,176 @@ const Socks5Proxy = struct {
                             }
                             self.enqueue_connection_close(connection);
                         },
-                        // TODO: finish
-                        .command_negotiation => {},
-                        .transferring => {},
+
+                        // There are two types of errors which may occur during the command_negotiation phase:
+                        // (1) Those that happen *before* the client sent the command_negotiation request.
+                        // (2) Those that happen *after* the client sent the command_negotiation request.
+                        //
+                        // For (1) we set state = terminating.command_negotiation and close the socket without a reply, so we shouldn't hit this path.
+                        // For (2) we must set state = terminating_with_reply and reply using build_command_success_reply before closing the client and server socket (if it exists).
+                        .command_negotiation => unreachable,
+
+                        // This path is handled at the start of the function by quickly returning from it
+                        // and leaving the shutdown and clean up for the peer to finish.
+                        .transferring => unreachable,
                     }
                 },
-                .command_negotiation => {},
+
                 .transferring => {
                     assert(connection.negotiated_command != .none);
                     assert(!self.pending_clients.contains(connection.socket));
                     assert(operation.send.timeout == null);
 
                     const session: *Session = self.active_sessions.getPtr(connection.session_id).?;
-                    assert(session.* == .connect);
+                    assert(session.* == .connect); // TODO(UDP)
                     assert(operation.send.socket == session.connect.server_tcp_data_plane.socket);
-                    // TODO: handle rest
-                    // TODO: verify whether this status enum is ever needed.
-                    // switch (session.status) {
-                    //     .active => {
-                    //         const is_short_send = bytes_sent != operation.send.buffer.len;
-                    //         if (is_short_send) {
-                    //             const no_timeout = null;
-                    //             self.enqueue_socket_send(
-                    //                 &connection.inflight_operation,
-                    //                 operation.send.socket,
-                    //                 operation.send.buffer[bytes_sent..],
-                    //                 operation.send.flags,
-                    //                 no_timeout,
-                    //             );
-                    //         } else {
-                    //             const recv_flags = 0;
-                    //             const no_timeout = null;
-                    //             self.enqueue_socket_recv(
-                    //                 &connection.inflight_operation,
-                    //                 connection.socket,
-                    //                 connection.buffer_ptr,
-                    //                 recv_flags,
-                    //                 no_timeout,
-                    //             );
-                    //         }
-                    //     },
-                    //     .terminating => {},
-                    // }
+
+                    const sent_all_bytes = operation.send.buffer.len == bytes_sent;
+                    if (sent_all_bytes) {
+                        const no_timeout = null;
+                        self.enqueue_connection_recv(connection, no_timeout);
+                    } else {
+                        // TODO: collect metrics for short writes
+                        assert(operation.send.buffer[bytes_sent..].len > 0);
+                        const no_timeout = null;
+                        self.enqueue_socket_send(
+                            &connection.inflight_operation,
+                            operation.send.socket,
+                            operation.send.buffer[bytes_sent..],
+                            operation.send.flags,
+                            no_timeout,
+                        );
+                    }
                 },
+
+                .terminating_with_reply => |reply| {
+                    assert(reply != .success);
+                    assert(connection.negotiated_command != .none);
+                    assert(!self.active_sessions.contains(connection.session_id));
+
+                    const server_socket_was_created = operation.send.socket != connection.socket;
+                    if (server_socket_was_created) {
+                        const server_socket = connection.socket;
+                        assert(!self.pending_clients.contains(server_socket));
+                        assert(reply != .command_not_supported and reply != .address_type_not_supported);
+                    } else {
+                        assert(self.pending_clients.contains(connection.socket));
+                        assert(reply == .socks_server_failure or reply == .command_not_supported or reply == .address_type_not_supported);
+                    }
+
+                    const sent_all_command_failure_reply_bytes = bytes_sent == operation.send.buffer.len;
+                    if (sent_all_command_failure_reply_bytes) {
+                        @branchHint(.likely);
+                        if (server_socket_was_created) {
+                            const server_socket = connection.socket;
+                            const client_socket = operation.send.socket;
+                            assert(client_socket != server_socket);
+                            // Reset the socket field to its original value and start by closing the server_socket and then the client_socket.
+                            connection.socket = client_socket;
+                            self.enqueue_close(&connection.inflight_operation, server_socket);
+                        } else {
+                            // The easy path, the command negotiation failed before server_socket creation.
+                            // So we simply close the client socket and free the connection + buffer.
+                            self.enqueue_connection_close(connection);
+                        }
+                    } else {
+                        // TODO: Add warn for short tcp send.
+                        assert(operation.send.buffer[bytes_sent..].len > 0);
+                        self.enqueue_socket_send(
+                            &connection.inflight_operation,
+                            operation.send.socket,
+                            operation.send.buffer[bytes_sent..],
+                            operation.send.flags,
+                            if (operation.send.timeout) |timeout| .{
+                                .ts = timeout.ts,
+                                .flags = timeout.flags,
+                            } else null,
+                        );
+                    }
+                },
+
                 else => {},
             }
         } else |err| {
             switch (err) {
-                error.CANCELED => return, // We just drop everything.
+                error.NOTSOCK, error.OPNOTSUPP => unreachable,
+                error.ISCONN, error.MSGSIZE, error.NOTCONN => unreachable,
+                error.ACCES, error.AGAIN, error.ALREADY, error.BADF => unreachable,
+                error.DESTADDRREQ, error.FAULT, error.INTR, error.INVAL => unreachable,
 
-                error.ACCES, error.AGAIN, error.ALREADY, error.BADF, error.DESTADDRREQ, error.FAULT, error.INTR, error.INVAL, error.ISCONN, error.MSGSIZE, error.NOTCONN, error.NOTSOCK, error.OPNOTSUPP => unreachable,
+                error.CANCELED => {
+                    std.log.debug("client(ip={d}, port={d}): send operation timed out when sending command reply.", .{
+                        connection.remote_ip_address(),
+                        connection.port(),
+                    });
+                    maybe(connection.negotiated_command == .none); // TODO: verify other instances of this.
+                    assert(connection.state == .terminating_with_reply);
 
-                error.NOBUFS, error.NOMEM => {
-                    // TODO: handle
+                    const reply = connection.state.terminating_with_reply;
+                    assert(reply != .success);
+                    assert(!self.active_sessions.contains(connection.session_id));
+
+                    const server_socket_was_created = operation.send.socket != connection.socket;
+                    if (server_socket_was_created) {
+                        const server_socket = connection.socket;
+                        const client_socket = operation.send.socket;
+                        assert(self.pending_clients.contains(client_socket));
+                        assert(!self.pending_clients.contains(server_socket));
+                        // Further restrict the possible replies after server_socket was created.
+                        assert(reply != .command_not_supported and reply != .address_type_not_supported);
+                    } else {
+                        assert(self.pending_clients.contains(connection.socket));
+                        assert(reply == .socks_server_failure or // Could be encountered if the socket creation fails.
+                            reply == .command_not_supported or reply == .address_type_not_supported);
+                    }
+
+                    if (server_socket_was_created) {
+                        const server_socket = connection.socket;
+                        const client_socket = operation.send.socket;
+                        connection.socket = client_socket; // NOTE(important): Undoing the hack.
+                        self.enqueue_close(&connection.inflight_operation, server_socket);
+                    } else {
+                        self.enqueue_connection_close(connection);
+                    }
                 },
 
-                error.PIPE, error.CONNRESET => {
-                    // defer assert(connection.state != .transferring);
-                    
-                    // NOTE: We can't be certain about what caused an EPIPE error as it's inherently racy.
-                    // So checking that this connection is part of a session and that the other peer forced a shutdown is futile.
-                    // What matters is that clean up be executed.
-                    // NOTE: usage of shutdown(2) is inherently racy in any case.
+                error.NOBUFS, error.NOMEM => {
+                    std.log.debug("client(ip={d}, port={d}): encountered system resources problem on send: {any}. retrying the operation.", .{
+                        connection.remote_ip_address(),
+                        connection.port(),
+                        err,
+                    });
+                    self.enqueue_socket_send(
+                        &connection.inflight_operation,
+                        operation.send.socket,
+                        operation.send.buffer,
+                        operation.send.flags,
+                        if (operation.send.timeout) |timeout|
+                            .{ .flags = timeout.flags, .ts = timeout.ts }
+                        else
+                            null,
+                    );
+                },
+
+                else => {
+                    // Could be (error.PIPE | error.CONNRESET) or some other error.
+                    if (err == error.PIPE or err == error.CONNRESET) {
+                        std.log.debug("client(ip={d}, port={d}, state={any}): encountered send error: {any}.", .{
+                            connection.remote_ip_address(), connection.port(), connection.state, err,
+                        });
+                    } else {
+                        std.log.warn("client(ip={d}, port={d}, state={any}): unexpected send error: {any}.", .{
+                            connection.remote_ip_address(), connection.port(), connection.state, err,
+                        });
+                    }
+                    defer assert(connection.state == .terminating or
+                        (connection.state == .terminating_with_reply and connection.state.terminating_with_reply != .success));
                     if (self.active_sessions.getPtr(connection.session_id)) |session| {
-                        assert(session.* == .connect); // NOTE: We don't use BIND, so assert that it's a CONNECT.
+                        // NOTE(UDP): This path is unreachable as we don't send data to the tcp control socket after establishing the session.
+                        // NOTE(BIND): Not going to be implemented.
+                        assert(session.* == .connect);
+                        session.assert_invariants();
+
                         assert(connection.state == .transferring);
                         assert(connection.negotiated_command != .none);
                         assert(!self.pending_clients.contains(connection.socket));
@@ -1284,17 +2262,11 @@ const Socks5Proxy = struct {
                         self.enqueue_shutdown(
                             &connection.inflight_operation,
                             session.connect.server_tcp_data_plane.socket,
-                            linux.SHUT.RDWR,
                         );
                     } else {
+                        assert(self.pending_clients.contains(connection.socket));
                         switch (connection.state) {
                             .auth_method_negotiation, .auth_sub_negotiation, .command_negotiation => {
-                                std.log.debug("client(ip={d}, port={d}): encountered send error during {any}: {s}.", .{
-                                    connection.remote_ip_address(),
-                                    connection.port(),
-                                    connection.state,
-                                    @errorName(err),
-                                });
                                 connection.state = .{ .terminating = switch (connection.state) {
                                     .auth_method_negotiation => .auth_method_negotiation,
                                     .auth_sub_negotiation => .auth_sub_negotiation,
@@ -1303,44 +2275,30 @@ const Socks5Proxy = struct {
                                 } };
                                 self.enqueue_connection_close(connection);
                             },
+
                             .terminating_with_reply => |reply| {
                                 assert(reply != .success);
-                                std.log.debug("client(ip={d}, port={d}): encountered send error while replying to command request: {s}.", .{
-                                    connection.remote_ip_address(),
-                                    connection.port(),
-                                    @errorName(err),
-                                });
                                 self.enqueue_connection_close(connection);
                             },
 
-                            // This state is only used for coordinating the shutdown of a session.
-                            // Not of individual clients in negotiation.
-                            .terminated => unreachable,
-                            .awaiting_udp_message => unreachable,
+                            .terminating => |phase| switch (phase) {
+                                .transferring => unreachable,
+                                .command_negotiation => unreachable,
+                                .auth_method_negotiation, .auth_sub_negotiation => self.enqueue_connection_close(connection),
+                            },
 
-                            // Being in a `terminating` state during any phase should prevent us from reaching
-                            // the send handler.
-                            // If `terminating` is set during a negotiation, we shouldn't reach this send handler,
-                            // we should be issuing a close(2) and calling the handler for its CQE.
-                            //
-                            // If this is set after the session has been established, then the session should exist
-                            // in the hash_map lookup in the previous branch.
-                            .terminating => unreachable,
+                            // These are post session establishement states. (Along with terminating.transferring).
+                            .transferring, .terminated => unreachable,
 
-                            // This state may only be reached when a session exists.
-                            .transferring => unreachable,
+                            .awaiting_udp_message => unreachable, // TODO(UDP)
                         }
                     }
-                },
-
-                else => {
-                    // TODO: Handle other send errors.
                 },
             }
         }
     }
 
-    pub fn handle_recv(self: *Socks5Proxy, completion: *linux.io_uring_cqe) void {
+    pub fn handle_recv(self: *Socks5Proxy, completion: *const linux.io_uring_cqe) void {
         const operation: *Operation = @ptrFromInt(completion.user_data);
         assert(operation.* == .recv);
         assert(operation.recv.socket > 2);
@@ -1352,10 +2310,6 @@ const Socks5Proxy = struct {
         const connection: *Connection = @alignCast(@fieldParentPtr("inflight_operation", operation));
         assert(connection.kind == .client_tcp or connection.kind == .server_tcp);
 
-        //
-        const is_misdirected_receive = operation.recv.socket != connection.socket;
-        assert(!is_misdirected_receive);
-
         switch (connection.kind) {
             .client_tcp => self.handle_client_tcp_receive(connection, completion),
             .server_tcp => self.handle_server_tcp_receive(connection, completion),
@@ -1363,9 +2317,71 @@ const Socks5Proxy = struct {
         }
     }
 
-    pub fn handle_client_tcp_receive(self: *Socks5Proxy, connection: *Connection, completion: *linux.io_uring_cqe) void {
+    pub fn handle_client_tcp_receive(self: *Socks5Proxy, connection: *Connection, completion: *const linux.io_uring_cqe) void {
         assert(connection.kind == .client_tcp);
-        assert(connection.inflight_operation == .recv);
+        const operation: *Operation = @ptrFromInt(completion.user_data);
+        assert(operation == &connection.inflight_operation);
+        assert(operation.* == .recv);
+
+        // Unlike sends, only a socket's owning Connection may use recv(2) on it to read bytes from it.
+        // That is, when a Connection's inflight_operation generates a CQE, only that CQE's handler
+        // is allowed to issue receives on that socket using that Connection's inflight_operation.
+        switch (connection.state) {
+            .awaiting_udp_message => unreachable, // TODO(UDP)
+
+            .auth_method_negotiation, .auth_sub_negotiation, .command_negotiation, .terminating_with_reply => assert(connection.socket == operation.recv.socket),
+
+            .terminating => |phase| switch (phase) {
+                // The peer can set the terminating state for us after the session has been established.
+                .transferring => assert(connection.socket == operation.recv.socket),
+
+                // Before the session has been established, only a CQE for the Connection can set its state:
+                // We should therefore not issue another recv(2) after having set the state to terminating.
+                .auth_method_negotiation, .auth_sub_negotiation, .command_negotiation => unreachable,
+            },
+
+            // We must check the state within every send/recv handler and stop issuing further syscalls to avoid generating further CQEs.
+            // An earlier receive should've been canceled and a CQE posted. During the posting of such an CQE,
+            // we must check that we are `terminating` and stop queueing more syscalls before we are moved into a `terminated` state.
+            .terminated => assert(connection.socket == operation.recv.socket),
+
+            .transferring => assert(connection.socket == operation.recv.socket),
+        }
+
+        // NOTE: See the other occurence of this variable and read its documentation for details.
+        const session_terminating_or_terminated: bool =
+            connection.state == .terminated or (connection.state == .terminating and connection.state.terminating == .transferring);
+
+        if (session_terminating_or_terminated) {
+            const session: *Session = self.active_sessions.getPtr(connection.session_id).?;
+            assert(session.* == .connect); // TODO(important): visit when implement udp associate.
+            assert(connection == &session.connect.client_tcp_data_plane);
+
+            const server_connection: *Connection = &session.connect.server_tcp_data_plane;
+            assert(connection.socket != server_connection.socket);
+
+            assert(server_connection.state == .terminated or
+                (server_connection.state == .terminating and server_connection.state.terminating == .transferring));
+
+            // NOTE: see other occurence of this variable for explanation.
+            const server_terminated = server_connection.state == .terminated;
+            if (!server_terminated) {
+                assert(connection.state != .terminated);
+                assert(!self.pending_clients.contains(connection.socket));
+            } else {
+                maybe(self.pending_clients.contains(connection.socket));
+            }
+
+            // TODO(IMPORTANT): ensure that the close(2) handler has a similar check
+            const is_last_cqe = connection.state == .terminated;
+            if (!is_last_cqe) {
+                @branchHint(.likely);
+                connection.inflight_operation = .{ .nop = {} };
+            } else {
+                self.stop_proxying(session);
+            }
+            return;
+        }
 
         const result: OsError!usize = if (completion.res < 0)
             io_utils.io_uring_error(completion.res)
@@ -1373,11 +2389,13 @@ const Socks5Proxy = struct {
             @intCast(completion.res);
 
         if (result) |bytes_received| {
-            std.log.debug("client(ip={d}, port={d}): sent bytes: {d}.", .{
+            std.log.debug("client(ip={d}, port={d}, state={any}): recv bytes: {d}.", .{
                 connection.remote_ip_address(),
                 connection.port(),
+                connection.state,
                 bytes_received,
             });
+
             if (bytes_received > 0) {
                 switch (connection.state) {
                     .auth_method_negotiation => |bytes_so_far| {
@@ -1423,15 +2441,10 @@ const Socks5Proxy = struct {
                                     self.enqueue_connection_close(connection);
                                 }
                             },
-
-                            .tls => {
-                                // TODO: Does credentials_sub_negotiation_request_message_max_size apply here?
-                                // u9 allows storing 511 bytes, is that enough for a command request that was encrypted using tls?
-                            },
-
                             else => unreachable,
                         }
                     },
+
                     .command_negotiation => |bytes_so_far| {
                         assert(connection.negotiated_command == .none);
                         assert(self.pending_clients.contains(connection.socket));
@@ -1439,7 +2452,7 @@ const Socks5Proxy = struct {
 
                         switch (connection.negotiated_auth_method) {
                             .none, .credentials => {
-                                // NOTE: It is possible to use MSG_WAITALL to wait for the minimum viable size amount of bytes.
+                                // NOTE: It is possible to use MSG_WAITALL to wait for the minimum viable amount of bytes.
                                 const total_command_negotiation_bytes_received = bytes_so_far + bytes_received;
                                 if (total_command_negotiation_bytes_received <= command_negotiation_request_message_max_size) {
                                     connection.state.command_negotiation += @intCast(bytes_received);
@@ -1453,12 +2466,7 @@ const Socks5Proxy = struct {
                                     self.enqueue_connection_close(connection);
                                 }
                             },
-                            .tls => {
-                                // decrypt in place before calling handle_client_command_negotiation?
-                                // how to do deal with short receives?
-                                unreachable;
-                            },
-                            else => {},
+                            else => unreachable,
                         }
                     },
 
@@ -1466,68 +2474,169 @@ const Socks5Proxy = struct {
                         assert(connection.negotiated_command != .none);
                         assert(!self.pending_clients.contains(connection.socket));
 
-                        // TODO: Transfer bytes to server.
                         const session: *Session = self.active_sessions.getPtr(connection.session_id).?;
+                        session.assert_invariants();
+
                         switch (session.*) {
-                            .connect => |*tcp_session| {
-                                assert(tcp_session.server_tcp_data_plane.kind == .server_tcp);
-                                assert(tcp_session.server_tcp_data_plane.session_id == connection.session_id);
-                                // TODO: Finish
-                                // switch (tcp_session.status) {
-                                //     .active => {
-                                //         switch (connection.negotiated_auth_method) {
-                                //             .none, .credentials => {
-                                //                 const send_flags = 0;
-                                //                 const no_timeout = null;
-                                //                 self.enqueue_socket_send(
-                                //                     &connection.inflight_operation,
-                                //                     tcp_session.server_tcp_data_plane.socket,
-                                //                     connection.buffer_ptr[0..bytes_received],
-                                //                     send_flags,
-                                //                     no_timeout,
-                                //                 );
-                                //             },
-                                //             .tls => {}, // TODO: unwrap data before sending it to the server. (what about short recv?).
-                                //             else => unreachable,
-                                //         }
-                                //     },
-                                //     .terminating => {
-                                //         // TODO: use the client's inflight operation to cancel the server's inflight operation ?
-                                //         // (server_tcp_recv == 0) and (client_tcp_recv == 0)
-                                //     },
-                                // }
+                            .connect => |*connect_session| {
+                                const client_connection: *Connection = &connect_session.client_tcp_data_plane;
+                                const server_connection: *Connection = &connect_session.server_tcp_data_plane;
+                                assert(connection == client_connection);
+
+                                const send_flags = 0;
+                                const no_timeout = null;
+                                self.enqueue_socket_send(
+                                    &client_connection.inflight_operation,
+                                    server_connection.socket,
+                                    client_connection.buffer_ptr[0..bytes_received],
+                                    send_flags,
+                                    no_timeout,
+                                );
                             },
-                            .udp_associate => |*udp_session| {
-                                // It is an error for the client control plane tcp socket to send us bytes.
-                                // It should only call close(2) on its socket to signal EOF which gets handled in the (bytes_received == 0) branch.
-                                std.log.debug("client(ip={d}, port={d}): tcp non zero receive on control plane socket.", .{
-                                    connection.remote_ip_address(),
-                                    connection.port(),
-                                });
-                                // TODO: terminate udp session
-                                _ = &udp_session;
+                            // It is an error for the client control plane tcp socket to send us bytes.
+                            // It should only call close(2) on its socket to signal EOF which gets handled in the (bytes_received == 0) branch.
+                            .udp_associate => unreachable, // TODO(UDP)
+                        }
+                    },
+
+                    // As the name of the state implies, this connection should've *sent* not received.
+                    .terminating_with_reply => unreachable,
+
+                    // When terminating in a phase other than transferring, we don't issue a client tcp receive.
+                    // When this state is set, either a send or close will be issued.
+                    .terminating => unreachable,
+
+                    // This state, along with terminating.transferring must've been handled earlier in the callback.
+                    .terminated => unreachable,
+
+                    .awaiting_udp_message => unreachable, // TODO(UDP)
+                }
+            } else {
+                switch (connection.state) {
+                    .auth_method_negotiation, .auth_sub_negotiation, .command_negotiation => {
+                        assert(self.pending_clients.contains(connection.socket));
+                        assert(!self.active_sessions.contains(connection.session_id));
+                        connection.state = .{ .terminating = switch (connection.state) {
+                            .auth_method_negotiation => .auth_method_negotiation,
+                            .auth_sub_negotiation => .auth_sub_negotiation,
+                            .command_negotiation => .command_negotiation,
+                            else => unreachable,
+                        } };
+                        self.enqueue_connection_close(connection);
+                    },
+
+                    .awaiting_udp_message => unreachable, // TODO(UDP)
+
+                    .transferring => {
+                        const session: *Session = self.active_sessions.getPtr(connection.session_id).?;
+                        session.assert_invariants();
+
+                        switch (session.*) {
+                            .connect => |*connect_session| {
+                                const client_connection: *Connection = &connect_session.client_tcp_data_plane;
+                                const server_connection: *Connection = &connect_session.server_tcp_data_plane;
+                                assert(connection == client_connection);
+
+                                assert(!self.pending_clients.contains(client_connection.socket));
+                                assert(!self.pending_clients.contains(server_connection.socket));
+
+                                client_connection.state = .{ .terminating = .transferring };
+                                server_connection.state = .{ .terminating = .transferring };
+                                self.enqueue_shutdown(
+                                    &client_connection.inflight_operation,
+                                    server_connection.socket,
+                                );
+                            },
+                            .udp_associate => |*udp_associate_session| {
+                                // TODO: Implement udp. This is the happy path for closing the section.
+                                _ = udp_associate_session;
                             },
                         }
                     },
 
-                    // TODO: implement transferring phase
-                    else => unreachable,
+                    // See the state switch in the (bytes_received > 0) branch for an explanation for why these are unreachable.
+                    .terminating_with_reply => unreachable,
+                    .terminating => unreachable,
+                    .terminated => unreachable,
                 }
-            } else {
-                // NOTE: Although this could be a TCP half close, we simply tear down everything associated with this client.
-                // Clients that care about half close type of behaviour should use appropriate protocols implementing such a feature.
-                self.handle_disconnection(connection);
-                return;
             }
         } else |err| {
-            _ = &err;
-        }
-        // const recv_operation: *Operation = connection.inflight_operation.recv.buffer[0..]
-    }
+            switch (err) {
+                error.AGAIN, error.BADF, error.INTR, error.INVAL => unreachable,
+                error.NOTCONN, error.NOTSOCK, error.OPNOTSUPP, error.TIMEDOUT, error.IO => unreachable,
 
-    pub fn handle_disconnection(self: *Socks5Proxy, connection: *Connection) void {
-        _ = self;
-        _ = connection;
+                error.NOBUFS, error.NOMEM => {
+                    std.log.warn("client(ip={d}, port={d}, state={any}): no system resources when receiving data: {any}.", .{
+                        connection.remote_ip_address(),
+                        connection.port(),
+                        connection.state,
+                        err,
+                    });
+                    self.enqueue_socket_recv(
+                        &connection.inflight_operation,
+                        operation.recv.socket,
+                        operation.recv.buffer,
+                        operation.recv.flags,
+                        if (operation.recv.timeout) |timeout| .{
+                            .ts = timeout.ts,
+                            .flags = timeout.flags,
+                        } else null,
+                    );
+                },
+
+                else => {
+                    std.log.warn("client(ip={d}, port={d}, state={any}): unexpected error when receiving data: {any}.", .{
+                        connection.remote_ip_address(),
+                        connection.port(),
+                        connection.state,
+                        err,
+                    });
+                    if (self.active_sessions.getPtr(connection.session_id)) |session| {
+                        session.assert_invariants();
+                        switch (session.*) {
+                            .connect => |*connect_session| {
+                                const client_connection: *Connection = &connect_session.client_tcp_data_plane;
+                                const server_connection: *Connection = &connect_session.server_tcp_data_plane;
+                                assert(client_connection == connection);
+
+                                assert(client_connection.state == .transferring);
+                                assert(server_connection.state == .transferring);
+
+                                assert(!self.pending_clients.contains(client_connection.socket));
+                                assert(!self.pending_clients.contains(server_connection.socket));
+
+                                client_connection.state = .{ .terminating = .transferring };
+                                server_connection.state = .{ .terminating = .transferring };
+                                self.enqueue_shutdown(
+                                    &client_connection.inflight_operation,
+                                    server_connection.socket,
+                                );
+                            },
+                            .udp_associate => unreachable, // TODO(UDP)
+                        }
+                    } else {
+                        switch (connection.state) {
+                            .auth_method_negotiation, .auth_sub_negotiation, .command_negotiation => {
+                                connection.state = .{ .terminating = switch (connection.state) {
+                                    .auth_method_negotiation => .auth_method_negotiation,
+                                    .auth_sub_negotiation => .auth_sub_negotiation,
+                                    .command_negotiation => .command_negotiation,
+                                    else => unreachable,
+                                } };
+                                self.enqueue_connection_close(connection);
+                            },
+
+                            .awaiting_udp_message => unreachable, // TODO(UDP)
+
+                            .transferring => unreachable,
+                            .terminating_with_reply => unreachable,
+                            .terminating => unreachable, // When terminating a phase other than .transferring, we don't receive anymore data.
+                            .terminated => unreachable,
+                        }
+                    }
+                },
+            }
+        }
     }
 
     pub fn handle_client_command_negotiation(self: *Socks5Proxy, connection: *Connection) void {
@@ -1535,6 +2644,7 @@ const Socks5Proxy = struct {
         assert(connection.state == .command_negotiation);
         assert(connection.state.command_negotiation > 0);
 
+        // TODO: decapsulate bytes first.
         const command_negotiation_bytes = connection.buffer_ptr[0..connection.state.command_negotiation];
         const command_request = parse_command_negotiation_request(command_negotiation_bytes) catch |err| {
             switch (err) {
@@ -1558,10 +2668,10 @@ const Socks5Proxy = struct {
                     );
                 },
                 else => {
-                    std.log.debug("client(ip={d}, port={d}): command negotiation error: {s}", .{
+                    std.log.debug("client(ip={d}, port={d}): command negotiation error: {any}", .{
                         connection.remote_ip_address(),
                         connection.port(),
-                        @errorName(err),
+                        err,
                     });
                     connection.state = .{ .terminating = .command_negotiation };
                     self.enqueue_connection_close(connection);
@@ -1573,17 +2683,48 @@ const Socks5Proxy = struct {
         if (self.validate_command_request(connection, command_request)) |err| {
             defer assert(connection.state == .terminating_with_reply);
             switch (err) {
-                error.BindCommandNotSupported => {
+                error.BindCommandNotSupported, error.ConnectCommandNotSupported, error.UdpAssociateCommandNotSupported => {
+                    std.log.debug("client(ip={d}, port={d}): unsupported command: {any}.", .{
+                        connection.remote_ip_address(),
+                        connection.port(),
+                        command_request.command,
+                    });
                     self.enqueue_connection_reply_for_termination(connection, .command_not_supported);
                 },
                 error.AddressTypeNotSupported => {
+                    std.log.debug("client(ip={d}, port={d}): unsupported address_type: {any}.", .{
+                        connection.remote_ip_address(),
+                        connection.port(),
+                        command_request.address_type(),
+                    });
                     self.enqueue_connection_reply_for_termination(connection, .address_type_not_supported);
                 },
-                error.ForbiddenPort, error.Forbidden_IPV4_Address, error.Forbidden_IPV6_Address, error.ForbiddenDomainName => {
+                error.ForbiddenDomainName => {
+                    std.log.debug("client(ip={d}, port={d}): forbidden domain_name: `{s}`.", .{
+                        connection.remote_ip_address(),
+                        connection.port(),
+                        command_request.destination_address.domain_name.fqdn,
+                    });
+                    self.enqueue_connection_reply_for_termination(connection, .ruleset_violation);
+                },
+                error.ForbiddenPort => {
+                    std.log.debug("client(ip={d}, port={d}): forbidden port: {d}.", .{
+                        connection.remote_ip_address(),
+                        connection.port(),
+                        command_request.destination_port(),
+                    });
+                    self.enqueue_connection_reply_for_termination(connection, .ruleset_violation);
+                },
+                error.Forbidden_IPV4_Address, error.Forbidden_IPV6_Address => {
+                    std.log.debug("client(ip={d}, port={d}): forbidden destination address: {d}.", .{
+                        connection.remote_ip_address(),
+                        connection.port(),
+                        command_request.destination_ip_address(),
+                    });
                     self.enqueue_connection_reply_for_termination(connection, .ruleset_violation);
                 },
                 error.Invalid_UDP_Source => {
-                    std.log.debug("client(ip={d}, port={d}): used invalid dst.addr and/or dst.port for the udp association.", .{
+                    std.log.debug("client(ip={d}, port={d}): invalid dst.addr and/or dst.port for the udp association.", .{
                         connection.remote_ip_address(),
                         connection.port(),
                     });
@@ -1606,8 +2747,11 @@ const Socks5Proxy = struct {
             return;
         }
 
+        defer assert(connection.negotiated_command != .none);
+
         switch (command_request.command) {
             .udp_associate => {
+                connection.negotiated_command = .udp_associate;
                 assert(command_request.destination_port() == 0 and command_request.destination_ip_address() == 0);
                 const domain = command_request.address_family();
                 const socket_type = linux.SOCK.DGRAM;
@@ -1620,6 +2764,7 @@ const Socks5Proxy = struct {
                 );
             },
             .connect => {
+                connection.negotiated_command = .connect;
                 assert(command_request.destination_port() > 0);
                 const domain = command_request.address_family();
                 const socket_type = linux.SOCK.STREAM;
@@ -1639,6 +2784,9 @@ const Socks5Proxy = struct {
     const CommandValidationError = error{
         /// BIND will never be supported.
         BindCommandNotSupported,
+        ConnectCommandNotSupported,
+        UdpAssociateCommandNotSupported,
+
         AddressTypeNotSupported,
 
         ForbiddenDomainName,
@@ -1652,11 +2800,21 @@ const Socks5Proxy = struct {
 
     pub fn validate_command_request(self: *Socks5Proxy, connection: *Connection, command_request: CommandRequest) ?CommandValidationError {
         assert(connection.kind == .client_tcp);
+        assert(command_request.command != .none); // Should've been parsed away.
 
         // NOTE: For now we reject all addresses of type domain name.
-        // TODO: Remove this domain_name address type check.
-        if (command_request.command == .bind) return error.BindCommandNotSupported;
+        // TODO: Add supported_address_types for the destination_address check below instead of a single check.
         if (command_request.destination_address == .domain_name) return error.AddressTypeNotSupported;
+
+        const is_supported_command = std.mem.findScalar(Command, &available_commands, command_request.command) != null;
+        if (!is_supported_command) {
+            return switch (command_request.command) {
+                .bind => error.BindCommandNotSupported,
+                .connect => error.ConnectCommandNotSupported,
+                .udp_associate => error.UdpAssociateCommandNotSupported,
+                else => unreachable,
+            };
+        }
 
         if (command_request.command == .udp_associate) {
             if (command_request.destination_address == .domain_name)
@@ -1738,10 +2896,10 @@ const Socks5Proxy = struct {
                     );
                 },
                 else => {
-                    std.log.debug("client(ip={d}, port={d}): credentials subnegotiation error: {s}", .{
+                    std.log.debug("client(ip={d}, port={d}): credentials subnegotiation error: {any}", .{
                         connection.remote_ip_address(),
                         connection.port(),
-                        @errorName(err),
+                        err,
                     });
                     connection.state = .{ .terminating = .auth_sub_negotiation };
                     const send_flags = 0;
@@ -1759,6 +2917,9 @@ const Socks5Proxy = struct {
         };
         assert(credentials.username.len > 0);
         assert(credentials.password.len > 0);
+
+        // TODO(Credentials)
+        unreachable;
 
         // Have a few threads which will do the CPU intensive hashing and notify the ring about the result.
         // SessionId -> Password_Hash.
@@ -1790,11 +2951,7 @@ const Socks5Proxy = struct {
                     );
                 },
                 else => {
-                    std.log.debug("client(ip={d}, port={d}): auth negotiation error: {s}", .{
-                        connection.remote_ip_address(),
-                        connection.port(),
-                        @errorName(err),
-                    });
+                    std.log.debug("client(ip={d}, port={d}): auth negotiation error: {any}.", .{ connection.remote_ip_address(), connection.port(), err });
                     connection.state = .{ .terminating = .auth_method_negotiation };
                     self.enqueue_connection_close(connection);
                 },
@@ -1826,17 +2983,16 @@ const Socks5Proxy = struct {
         assert(connection.kind == .client_tcp);
         assert(connection.state == .auth_method_negotiation);
         assert(connection.state.auth_method_negotiation > 0);
-        defer assert(connection.state == .terminating or
-            connection.state.auth_method_negotiation == 0);
+        defer assert(connection.state.auth_method_negotiation == 0 or
+            (connection.state == .terminating and connection.state.terminating == .auth_method_negotiation));
 
         const auth_negotiation_reply: []const u8 = switch (auth_method) {
-            .tls => &accepted_tls_method_reply_message,
             .none => &accepted_none_method_reply_message,
             .credentials => &accepted_credentials_method_reply_message,
             .unacceptable => &unacceptable_auth_method_reply_message,
 
             // We should not reach this branch as we've already checked the available_methods before calling this function.
-            else => panic("client(ip={d}, port={d}): sent invalid auth_method: {d}.", .{ connection.remote_ip_address(), connection.port(), auth_method }),
+            else => unreachable,
         };
 
         std.log.debug("client(ip={d}, port={d}): sending auth_method: {any}", .{ connection.remote_ip_address(), connection.port(), auth_method });
@@ -1847,7 +3003,7 @@ const Socks5Proxy = struct {
             // we simply close the connection after any amount of reply bytes are sent, as it is unlikely for a TCP short write to occur.
             connection.state = .{ .auth_method_negotiation = 0 };
         } else {
-            // TODO: We must match this state in the handle_client_send and tear down connection.
+            // TODO: We must match this state in the handle_client_tcp_send and tear down connection.
             connection.state = .{ .terminating = .auth_method_negotiation };
         }
 
@@ -1862,13 +3018,7 @@ const Socks5Proxy = struct {
         );
     }
 
-    pub fn handle_server_tcp_receive(self: *Socks5Proxy, connection: *Connection, completion: *linux.io_uring_cqe) void {
-        assert(connection.kind == .server_tcp);
-        _ = self;
-        _ = completion;
-    }
-
-    pub fn handle_accept(self: *Socks5Proxy, completion: *linux.io_uring_cqe) void {
+    pub fn handle_accept(self: *Socks5Proxy, completion: *const linux.io_uring_cqe) void {
         const operation: *Operation = @ptrFromInt(completion.user_data);
         assert(operation.* == .accept);
         assert(operation.accept.socket == self.server_socket);
@@ -1877,25 +3027,50 @@ const Socks5Proxy = struct {
         const result: OsError!linux.fd_t = if (completion.res < 0)
             io_utils.io_uring_error(completion.res)
         else
-            completion.res;
+            @intCast(completion.res);
 
         if (result) |client_socket| {
+            std.log.debug("new client socket: {d}", .{client_socket});
             const clients_count = self.active_sessions.count() + self.pending_clients.count();
             assert(clients_count <= self.config.max_clients_count);
 
             if (clients_count < self.config.max_clients_count) {
                 self.handle_new_client(client_socket, operation.accept.address);
+                self.enqueue_accept_clients();
             } else {
-                self.enqueue_close_fd(&self.accept_operation, client_socket);
+                std.log.debug("proxy is at maximum capacity. can't accept any more clients.", .{});
+                self.enqueue_close(&self.accept_operation, client_socket);
             }
         } else |err| {
-            _ = &err;
-            // TODO: Inspect accept4(2) failures and how to restart the listener.
-            // TODO: handle error
+            std.log.err("handle_accept: encountered an error while accepting clients: {any}.", .{ err });
+            switch (err) {
+                error.CANCELED, error.PROTO => unreachable,
+                error.AGAIN, error.BADF => unreachable,
+                error.FAULT, error.NOTSOCK => unreachable,
+                error.INTR, error.OPNOTSUPP => unreachable,
+                error.INVAL, error.PERM => unreachable,
+
+                error.MFILE, error.NFILE, error.NOBUFS, error.NOMEM, => {
+                    std.log.warn("accept: lack of system resources when accepting new clients: {any}.", .{err});
+                    self.enqueue_accept_clients();
+                },
+                error.CONNABORTED => {
+                    std.log.debug("accept: client connection aborted before it finished the tcp handshake.", .{});
+                    self.enqueue_accept_clients();
+                },
+                else => {
+                    std.log.err(
+                        "accept: unexpected error when accepting new clients: {any}. " ++
+                        "please handle it as new clients won't be accepted after this.", .{err});
+                    // TODO: Restart the listener.
+                    // The reason I don't retry the syscall here is that the error could truly be
+                    // permanent, and more accept syscalls will simply cause more logs to be generated.
+                },
+            }
         }
     }
 
-    pub fn handle_read_signalfd(self: *Socks5Proxy, completion: *linux.io_uring_cqe) bool {
+    pub fn handle_read_signalfd(self: *Socks5Proxy, completion: *const linux.io_uring_cqe) bool {
         const operation: *Operation = @ptrFromInt(completion.user_data);
         assert(operation.* == .read_signalfd);
         assert(operation.read_signalfd.fd > 2);
@@ -1934,7 +3109,7 @@ const Socks5Proxy = struct {
                 },
                 else => {
                     // TODO: Explore what other errors might show up.
-                    std.log.err("signalfd: caught an unknown error: {s}", .{@errorName(err)});
+                    std.log.err("signalfd: caught an unknown error: {any}", .{err});
                 },
             }
         }
@@ -1950,10 +3125,6 @@ const Socks5Proxy = struct {
         assert(!self.pending_clients.contains(client_socket));
         assert(!self.active_sessions.contains(session_id));
         defer assert(self.pending_clients.contains(client_socket));
-
-        if (builtin.mode == .Debug or builtin.mode == .ReleaseSafe) {
-            // TODO: assert(SO_TYPE == TCP)
-        }
 
         const buffer_ptr = self.buffer_pool.get_array_ptr_assume_capacity();
         const client_connection = Connection{
@@ -1978,6 +3149,27 @@ const Socks5Proxy = struct {
             established_at_ns,
         });
 
+        if (is_debug_mode) {
+            if (net.get_socket_type(client_socket)) |socket_type| {
+                assert(socket_type == linux.SOCK.STREAM);
+            } else |err| {
+                std.log.err("client(ip={d}, port={d}): session_id={d} encountered an error while getting socket_type: {any}.", .{
+                    client_connection.remote_ip_address(),
+                    client_connection.port(),
+                    session_id,
+                    err,
+                });
+                switch (err) {
+                    error.FAULT => unreachable,
+                    error.BADF => unreachable,
+                    error.INVAL => unreachable,
+                    error.NOPROTOOPT => unreachable,
+                    error.NOTSOCK => unreachable,
+                    else => {}, // NOTE: We don't exit here since this could be a benign error such as EACCES / ENOBUFS.
+                }
+            }
+        }
+
         const client_connection_ptr: *Connection = self.pending_clients.getPtr(client_socket).?;
         const auth_deadline_ns: u64 = established_at_ns + (constants.max_auth_negotiation_deadline_sec * std.time.ns_per_s);
         self.enqueue_connection_recv(
@@ -1992,13 +3184,221 @@ const Socks5Proxy = struct {
         );
     }
 
-    pub fn enqueue_shutdown(self: *Socks5Proxy, operation: *Operation, socket: linux.fd_t, how: u32) void {
+    pub fn start_proxying(self: *Socks5Proxy, session: *Session) void {
+        switch (session.*) {
+            .udp_associate => |*udp_associate_session| {
+                const client_udp_connection: *Connection = &udp_associate_session.client_udp_data_plane;
+                const client_tcp_connection: *Connection = &udp_associate_session.client_tcp_control_plane;
+
+                assert(client_udp_connection.socket > 2);
+                assert(client_tcp_connection.socket > 2);
+
+                assert(client_tcp_connection.socket != client_udp_connection.socket);
+
+                assert(client_udp_connection.state == .transferring);
+                assert(client_tcp_connection.state == .transferring);
+
+                assert(!self.pending_clients.contains(client_udp_connection.socket));
+                assert(!self.pending_clients.contains(client_tcp_connection.socket));
+
+                assert(udp_associate_session.udp_destinations.items.len == 0);
+
+                const recv_flags = 0;
+                const no_timeout = null;
+                self.enqueue_socket_recv(
+                    &client_tcp_connection.inflight_operation,
+                    client_tcp_connection.socket,
+                    client_tcp_connection.buffer_ptr,
+                    recv_flags,
+                    no_timeout,
+                );
+                // TODO: handle udp receive here.
+            },
+            .connect => |*connect_session| {
+                const server_connection: *Connection = &connect_session.server_tcp_data_plane;
+                const client_connection: *Connection = &connect_session.client_tcp_data_plane;
+                assert(server_connection.session_id == client_connection.session_id);
+
+                assert(server_connection.socket > 2);
+                assert(client_connection.socket > 2);
+
+                assert(client_connection.socket != server_connection.socket);
+
+                assert(server_connection.state == .transferring);
+                assert(client_connection.state == .transferring);
+
+                assert(server_connection.negotiated_command != .none);
+                assert(client_connection.negotiated_command != .none);
+
+                assert(!self.pending_clients.contains(server_connection.socket));
+                assert(!self.pending_clients.contains(client_connection.socket));
+
+                const recv_flags = 0;
+                const no_timeout = null;
+                self.enqueue_socket_recv(
+                    &server_connection.inflight_operation,
+                    server_connection.socket,
+                    server_connection.buffer_ptr,
+                    recv_flags,
+                    no_timeout,
+                );
+                self.enqueue_socket_recv(
+                    &client_connection.inflight_operation,
+                    client_connection.socket,
+                    client_connection.buffer_ptr,
+                    recv_flags,
+                    no_timeout,
+                );
+            },
+        }
+    }
+
+    pub fn stop_proxying(self: *Socks5Proxy, session: *Session) void {
+        switch (session.*) {
+            .connect => |*connect_session| {
+                const client_connection: *Connection = &connect_session.client_tcp_data_plane;
+                const server_connection: *Connection = &connect_session.server_tcp_data_plane;
+
+                // Already checked in the session.id() up above.
+                // assert(client_connection.session_id == server_connection.session_id);
+
+                assert(client_connection.state == .terminated);
+                assert(server_connection.state == .terminated);
+
+                assert(client_connection.socket != server_connection.socket);
+
+                self.buffer_pool.put(client_connection.buffer_ptr);
+                self.buffer_pool.put(server_connection.buffer_ptr);
+
+                std.log.info("terminated: connect_session(id={d}, client(ip={d}, port={d}), server(ip={d}, port={d})).", .{
+                    session.id(),
+                    client_connection.remote_ip_address(),
+                    client_connection.port(),
+                    server_connection.remote_ip_address(),
+                    server_connection.port(),
+                });
+                const session_was_removed = self.active_sessions.remove(client_connection.session_id);
+                assert(session_was_removed);
+            },
+            // TODO: Review the udp associate session shutdown process.
+            .udp_associate => |*udp_associate_session| {
+                const client_udp_connection: *Connection = &udp_associate_session.client_udp_data_plane;
+                const client_tcp_connection: *Connection = &udp_associate_session.client_tcp_control_plane;
+
+                // Already checked in the session.id() up above.
+                // assert(client_udp_connection.session_id == client_tcp_connection.session_id);
+
+                assert(client_udp_connection.state == .terminated);
+                assert(client_tcp_connection.state == .terminated);
+
+                assert(client_udp_connection.socket != client_tcp_connection.socket);
+
+                self.buffer_pool.put(client_udp_connection.buffer_ptr);
+                self.buffer_pool.put(client_tcp_connection.buffer_ptr);
+
+                const server_connections_chunk = udp_associate_session.udp_destinations.allocatedSlice();
+                for (server_connections_chunk) |*server_udp_data_plane| {
+                    self.buffer_pool.put(server_udp_data_plane.buffer_ptr);
+                }
+                self.udp_connection_pool.put_chunk(server_connections_chunk);
+
+                const session_was_removed = self.active_sessions.remove(client_tcp_connection.session_id);
+                assert(session_was_removed);
+                std.log.info("terminated: udp_associate_session(id={d}, client_udp(ip={d}, port={d}), client_tcp(ip={d}, port={d})).", .{
+                    session.id(),
+                    client_udp_connection.remote_ip_address(),
+                    client_udp_connection.port(),
+                    client_tcp_connection.remote_ip_address(),
+                    client_tcp_connection.port(),
+                });
+            },
+        }
+    }
+
+    // This can be useful when retrying an operation when hitting a transient error (ENOMEM / ENOBUFS).
+    // pub fn enqueue_operation(self: *Socks5Proxy, operation: *Operation) void
+
+    pub fn enqueue_connect(
+        self: *Socks5Proxy,
+        operation: *Operation,
+        socket: linux.fd_t,
+        remote_address: PosixAddress,
+        timeout: struct { ts: linux.kernel_timespec, flags: u32 },
+    ) void {
         assert(socket > 2);
-        assert(how == linux.SHUT.RD or how == linux.SHUT.WR or how == linux.SHUT.RDWR);
-        operation.* = .{ .shutdown = .{
-            .socket = socket,
-            .how = how,
-        } };
+        assert(remote_address.any.family == linux.AF.INET or
+            remote_address.any.family == linux.AF.INET6);
+
+        assert(timeout.ts.sec > 0 or timeout.ts.nsec > 0);
+        if (is_debug_mode) {
+            // TODO: Assert not a forbidden remote_address. That is, it should've been filtered in the request parsing.
+        }
+        operation.* = .{
+            .connect = .{
+                .socket = socket,
+                .address = remote_address,
+                .timeout = .{
+                    .ts = .{
+                        .sec = timeout.ts.sec,
+                        .nsec = timeout.ts.nsec,
+                    },
+                    .flags = timeout.flags,
+                },
+            },
+        };
+
+        if (self.sq_space_left() < 2)
+            _ = self.submit_all_no_wait() catch unreachable;
+
+        const user_data: u64 = @intFromPtr(operation);
+        var connect_sqe = self.io_ring.connect(
+            user_data,
+            operation.connect.socket,
+            &operation.connect.address.any,
+            net.address_size_from_posix_address(&operation.connect.address),
+        ) catch unreachable;
+        connect_sqe.flags = linux.IOSQE_IO_LINK;
+
+        var link_timeout_sqe = self.io_ring.link_timeout(
+            user_data,
+            &operation.connect.timeout.ts,
+            operation.connect.timeout.flags,
+        ) catch unreachable;
+        link_timeout_sqe.flags |= linux.IOSQE_CQE_SKIP_SUCCESS;
+    }
+
+    pub fn enqueue_sendmsg(self: *Socks5Proxy, operation: *Operation, socket: linux.fd_t) void {
+        _ = &self;
+        _ = &operation;
+        _ = &socket;
+    }
+
+    pub fn enqueue_recvmsg(self: *Socks5Proxy, operation: *Operation, socket: linux.fd_t) void {
+        _ = &self;
+        _ = &operation;
+        _ = &socket;
+    }
+
+    pub fn enqueue_sendmsg_gso(self: *Socks5Proxy, operation: *Operation, socket: linux.fd_t) void {
+        _ = &self;
+        _ = &operation;
+        _ = &socket;
+    }
+
+    pub fn enqueue_recvmsg_gro(self: *Socks5Proxy, operation: *Operation, socket: linux.fd_t) void {
+        _ = &self;
+        _ = &operation;
+        _ = &socket;
+    }
+
+    pub fn enqueue_shutdown(self: *Socks5Proxy, operation: *Operation, socket: linux.fd_t) void {
+        assert(socket > 2);
+        operation.* = .{
+            .shutdown = .{
+                .socket = socket,
+            },
+        };
+        const how: u32 = linux.SHUT.RDWR;
         const user_data: u64 = @intFromPtr(operation);
         _ = self.io_ring.shutdown(user_data, socket, how) catch {
             warn_submission_queue_full(.shutdown);
@@ -2011,17 +3411,20 @@ const Socks5Proxy = struct {
     /// Can this cancel a close(2) / shutdown(2) operation ? Does it matter if we're shutting down anyway?
     /// If we encounter a SIGTERM/SIGINT in the middle of the CQEs array, do we ignore the later CQEs ?
     pub fn enqueue_cancel_all_requests(self: *Socks5Proxy) void {
-        // NOTE: we repurpose the `read_signalfd_operation` field for canceling
-        // all requests after receiving a signal like SIGTERM / SIGINT.
-        self.read_signalfd_operation = .{ .cancel_all_requests = {} };
+        assert(self.proxy_termination_operation == .nop);
 
-        const user_data: u64 = @intFromPtr(&self.read_signalfd_operation);
-        // Can be any value since we're targetting ANY inflight submission.
-        const cancel_user_data: u64 = 6_7;
+        // NOTE: We should not execute callbacks (in handle_cqes) once we issue a cancel_all_requests.
+        // The CQE processing loop (where this function gets called) must be stopped and the proxy shut down right after cancel_all_requests.
+        self.proxy_termination_operation = .{ .cancel_all_requests = {} };
+
+        // Can be any value since we're targetting any inflight operation.
+        const cancel_user_data: u64 = @intFromPtr("@");
+        const user_data: u64 = @intFromPtr(&self.proxy_termination_operation);
         const cancel_flags: u32 = linux.IORING_ASYNC_CANCEL_ANY;
-
-        // The reason I use unreachable here is because I assume that this function's called right after a call to submit_all_no_wait().
-        _ = self.io_ring.cancel(user_data, cancel_user_data, cancel_flags) catch unreachable;
+        _ = self.io_ring.cancel(user_data, cancel_user_data, cancel_flags) catch {
+            _ = self.submit_all_no_wait() catch unreachable;
+            _ = self.io_ring.cancel(user_data, cancel_user_data, cancel_flags) catch unreachable;
+        };
     }
 
     pub fn enqueue_create_socket(self: *Socks5Proxy, operation: *Operation, domain: u32, socket_type: u32, protocol: u32) void {
@@ -2058,18 +3461,26 @@ const Socks5Proxy = struct {
 
         connection.state = .{ .terminating_with_reply = reply };
         switch (connection.negotiated_auth_method) {
-            // TODO(asap): TLS wrap the `reply_bytes` and store them in connection.buffer_ptr.
-            .tls => unreachable,
-
             .none, .credentials => {
                 const send_flags = 0;
-                const no_timeout = null;
+                // https://datatracker.ietf.org/doc/html/rfc1928:
+                // When a reply (REP value other than X'00') indicates a failure, the
+                // SOCKS server MUST terminate the TCP connection shortly after sending
+                // the reply. This must be no more than 10 seconds after detecting the
+                // condition that caused a failure.
+                const failure_reply_deadline_ns = self.time.monotonic_clock() + (10 * std.time.ns_per_s);
                 self.enqueue_socket_send(
                     &connection.inflight_operation,
                     connection.socket,
                     reply_bytes,
                     send_flags,
-                    no_timeout,
+                    .{
+                        .ts = .{
+                            .sec = @intCast(failure_reply_deadline_ns / std.time.ns_per_s),
+                            .nsec = @intCast(failure_reply_deadline_ns % std.time.ns_per_s),
+                        },
+                        .flags = linux.IORING_TIMEOUT_ABS | linux.IORING_TIMEOUT_BOOTTIME,
+                    },
                 );
             },
             else => unreachable,
@@ -2078,8 +3489,8 @@ const Socks5Proxy = struct {
 
     pub fn enqueue_connection_close(self: *Socks5Proxy, connection: *Connection) void {
         // TODO: connection.state == .terminated
-        assert(connection.state == .terminating or connection.state == .terminating_with_reply);
-        self.enqueue_close_fd(&connection.inflight_operation, connection.socket);
+        assert(connection.state == .terminating or (connection.state == .terminating_with_reply and connection.state.terminating_with_reply != .success));
+        self.enqueue_close(&connection.inflight_operation, connection.socket);
     }
 
     // Enqueues a receive using the buffer_ptr. It doesn't take into account the current state.
@@ -2090,7 +3501,7 @@ const Socks5Proxy = struct {
         connection: *Connection,
         timeout: ?struct { flags: u32, ts: linux.kernel_timespec },
     ) void {
-        assert(connection.state != .terminating and connection.state != .terminating_with_reply);
+        assert(connection.state != .terminated and connection.state != .terminating and connection.state != .terminating_with_reply);
 
         if (connection.kind == .client_tcp) {
             // As described in the doc for the function, we're only allowed to call this function
@@ -2227,18 +3638,17 @@ const Socks5Proxy = struct {
         }
     }
 
-    pub fn enqueue_close_fd(self: *Socks5Proxy, operation: *Operation, fd: linux.fd_t) void {
-        assert(fd >= 0);
+    pub fn enqueue_close(self: *Socks5Proxy, operation: *Operation, fd: linux.fd_t) void {
+        assert(fd > 2);
         operation.* = .{
             .close = .{ .fd = fd },
         };
         const user_data: u64 = @intFromPtr(operation);
-        var close_sqe = self.io_ring.close(user_data, fd) catch close_sqe: {
+        _ = self.io_ring.close(user_data, fd) catch {
             warn_submission_queue_full(.close);
             _ = self.submit_all_no_wait() catch unreachable;
-            break :close_sqe self.io_ring.close(user_data, fd) catch unreachable;
+            _ = self.io_ring.close(user_data, fd) catch unreachable;
         };
-        close_sqe.flags |= linux.IOSQE_ASYNC;
     }
 
     pub fn enqueue_read_signalfd(self: *Socks5Proxy) void {
@@ -2344,7 +3754,7 @@ const Socks5Proxy = struct {
             arg.ts = @intFromPtr(&timespec);
         }
         _ = self.enter_with_extended_arg(sqes_to_submit, min_complete, flags, arg) catch |err| switch (err) {
-            // This error concerns the CQEs when min_complete > 0, the SQEs were submitted to the kernel.
+            // This error concerns the CQEs when min_complete > 0, the SQEs were submitted to the kernel regardless so we ignore it.
             error.TIME => {},
 
             // Only happens on ancient kernels according to Jens.
@@ -2411,7 +3821,7 @@ const Socks5Proxy = struct {
         self.io_ring.deinit();
     }
 
-    pub fn deinit(self: *Socks5Proxy, allocator: std.mem.Allocator) void {
+    pub fn deinit(self: *Socks5Proxy, allocator: Allocator) void {
         _ = linux.close(self.read_signalfd_operation.read_signalfd.fd);
         _ = linux.close(self.server_socket);
         self.io_ring.deinit();

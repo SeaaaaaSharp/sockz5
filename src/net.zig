@@ -9,9 +9,9 @@ const PosixAddress = IO.Threaded.PosixAddress;
 const address_to_posix = IO.Threaded.addressToPosix;
 
 const errno_as_error = @import("utils.zig").errno_as_error;
-const Errno = @import("utils.zig").Errno;
+const OsError = @import("utils.zig").OsError;
 
-pub fn setup_server_socket(address: IP_Address, listen_backlog: u32, defer_accept_timeout_sec: ?c_int) Errno!linux.fd_t {
+pub fn setup_server_socket(address: IP_Address, listen_backlog: u32, defer_accept_timeout_sec: ?c_int) OsError!linux.fd_t {
     // TODO: use multipath TCP ?
     // const address: IP_Address = try .parse(ip_address, port);
     const socket_fd_result = switch (address) {
@@ -47,7 +47,7 @@ pub fn setup_server_socket(address: IP_Address, listen_backlog: u32, defer_accep
 }
 
 /// Takes a cqe.res, returns the corresponding errno as an error.
-pub fn io_uring_error(res: i32) Errno {
+pub fn io_uring_error(res: i32) OsError {
     assert(res < 0);
     const errno: i32 = -res;
     const errno_enum: linux.E = @enumFromInt(errno);
@@ -94,4 +94,42 @@ pub fn is_private_ipv4_address(ip: u32) bool {
 pub fn is_loopback_ipv4_address(ip: u32) bool {
     const address: [4]u8 = std.mem.toBytes(ip);
     return address[0] == 127;
+}
+
+pub fn get_socket_type(socket: linux.fd_t) OsError!u32 {
+    assert(socket > 2);
+    var socket_type: c_int = 0;
+    var option_len: linux.socklen_t = @sizeOf(c_int);
+    const get_option_result = linux.getsockopt(socket, linux.SOL.SOCKET, linux.SO.TYPE, @ptrCast(&socket_type), &option_len);
+    if (linux.errno(get_option_result) != .SUCCESS)
+        return errno_as_error(linux.errno(get_option_result));
+
+    assert(socket_type >= 0 and socket_type <= std.math.maxInt(u32));
+    return @intCast(socket_type);
+}
+
+pub fn ip_address_from_posix_address(posix_address: *const PosixAddress) u128 {
+    return switch (posix_address.any.family) {
+        linux.AF.INET => @as(u128, posix_address.in.addr),
+        linux.AF.INET6 => std.mem.readInt(u128, &posix_address.in6.addr, .big), // TODO: test the endianess.
+        else => unreachable,
+    };
+}
+
+pub fn port_from_posix_address(posix_address: *const PosixAddress) u16 {
+    const port: u16 = switch (posix_address.any.family) {
+        linux.AF.INET => posix_address.in.port,
+        linux.AF.INET6 => posix_address.in6.port,
+        else => unreachable,
+    };
+    assert(port != 0); // Actually a valid port number that we don't support in the proxy.
+    return port;
+}
+
+pub fn address_size_from_posix_address(posix_address: *const PosixAddress) u32 {
+    return switch (posix_address.any.family) {
+        linux.AF.INET => @sizeOf(linux.sockaddr.in),
+        linux.AF.INET6 => @sizeOf(linux.sockaddr.in6),
+        else => unreachable,
+    };
 }
